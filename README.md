@@ -53,19 +53,7 @@ omarchy plugin disable eprom.gmail-notifier
 omarchy plugin remove eprom.gmail-notifier
 ```
 
-### Install / Update from source
-
-You can also run the local installer directly from this source folder:
-
-```bash
-bash install-local.sh
-```
-
-The script copies the plugin into `~/.config/omarchy/plugins/eprom.gmail-notifier/`, cleans up obsolete files, refreshes Omarchy's local plugin registry, validates it, enables it in the left bar, and restarts the Omarchy shell without overwriting your credentials or account configuration.
-
-The installer copies the plugin files into your Omarchy environment without overwriting your credentials or account configuration. A new installation starts clean without account placeholders. Add each account through the widget's **Add Gmail account** button and authorize it in Google; the plugin creates the account entry and securely stores its token in your desktop Secret Service.
-
-Requirements: Omarchy, `python3`, `secret-tool` (from `libsecret`), `notify-send` (from `libnotify`), and a working Secret Service in the desktop session. If a command is missing, install its package with your system package manager (`pacman -S libsecret libnotify`).
+Requirements: Omarchy, `python3`, `secret-tool` (from `libsecret`), `notify-send` (from `libnotify`), and a working Secret Service in the desktop session.
 
 ## Google OAuth setup
 
