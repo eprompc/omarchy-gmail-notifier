@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "eprom.gmail-notifier",
+  "name": "Gmail Notifier",
+  "version": "0.2.0",
+  "author": "Eprom",
+  "license": "GPL-3.0",
+  "description": "A lightweight per-account Gmail unread indicator for the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Gmail Notifier",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

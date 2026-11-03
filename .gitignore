@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+oauth-client.json
+config.json
+token.json
+snapshot.json
+snapshot.lock
+*.lock
+personal-config/
