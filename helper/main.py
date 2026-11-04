@@ -479,8 +479,14 @@ def notify_new(account: dict, unread_ids: list[str], access_token: str) -> None:
         except (NotifierError, IndexError):
             subject = f"{len(new_ids)} new unread message(s)"
         subprocess.run(
-            ["notify-send", "--icon=mail-unread", "--app-name=Gmail Notifier",
-             "Gmail · " + account["email"], subject],
+            [
+                "notify-send",
+                "--icon=mail-unread",
+                "--app-name=Gmail Notifier",
+                "--",
+                "Gmail · " + account["email"],
+                str(subject),
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,

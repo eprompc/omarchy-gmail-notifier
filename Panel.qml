@@ -142,6 +142,7 @@ Panel {
             visible: root.lastError.length > 0
             width: parent.width
             text: root.lastError
+            textFormat: Text.PlainText
             color: root.themeRed
             wrapMode: Text.WordWrap
           }
@@ -247,6 +248,7 @@ Panel {
             Text {
               width: parent.width - (Style.space(24) * 2 + Style.space(4) * 3 + initialField.width)
               text: (modelData.enabled === false ? "○ " : "● ") + modelData.email
+              textFormat: Text.PlainText
               color: modelData.enabled === false ? Color.muted : root.foreground
               elide: Text.ElideRight
               font.pixelSize: Style.font.body
@@ -578,6 +580,7 @@ Panel {
         Text {
           width: parent.width - updateAccountBtn.width - Style.space(8)
           text: parent.parent.selected ? parent.parent.selected.email : "No account selected"
+          textFormat: Text.PlainText
           color: root.panelAccent
           font.bold: true
           font.pixelSize: root.configuredFontSize
@@ -628,6 +631,7 @@ Panel {
           Text {
             width: parent.width
             text: root.senderDisplayName(modelData.from)
+            textFormat: Text.PlainText
             color: root.panelAccent
             font.bold: false
             font.pixelSize: root.configuredFontSize
@@ -636,6 +640,7 @@ Panel {
           Text {
             width: parent.width
             text: modelData.subject || root.tr("(sin asunto)", "(no subject)")
+            textFormat: Text.PlainText
             color: root.panelText
             font.pixelSize: root.configuredFontSize
             elide: Text.ElideRight

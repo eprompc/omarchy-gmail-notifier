@@ -345,6 +345,7 @@ BarWidget {
 
           Text {
             text: Model.normalizedInitial(accountButton.account.initial, accountButton.account.email)
+            textFormat: Text.PlainText
             color: accountButton.account.enabled === false
               ? Qt.rgba(accountButton.foreground.r, accountButton.foreground.g, accountButton.foreground.b, 0.45)
               : accountButton.foreground
@@ -372,6 +373,7 @@ BarWidget {
               id: countLabel
               anchors.centerIn: parent
               text: accountButton.unreadCount > 99 ? "99+" : String(accountButton.unreadCount)
+              textFormat: Text.PlainText
               color: countBadge.flashFill ? Color.background
                 : countBadge.active ? accountButton.activeColor
                 : accountButton.account.enabled === false
