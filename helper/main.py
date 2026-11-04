@@ -24,6 +24,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
+from alerts import AlertStore
 
 
 APP_DIR = Path.home() / ".config" / "omarchy" / "gmail-notifier"
@@ -159,6 +160,7 @@ def snapshot_result(config: dict, snapshot: dict | None) -> dict:
     errors = [f"{a.get('email', 'Account')}: {a['last_error']}" for a in accounts if a.get("last_error")]
     return {
         "ok": True,
+        "alerts": AlertStore(APP_DIR).visible(accounts),
         "accounts": accounts,
         "poll_interval_minutes": config["poll_interval_minutes"],
         "flash_duration_seconds": config.get("flash_duration_seconds", 60),
@@ -522,6 +524,8 @@ def build_snapshot(force: bool = False) -> dict:
                 token = token_lookup(account["email"])
                 access_token, _token = refresh_access_token(account["email"], token)
                 unread_ids = list_unread_ids(access_token)
+                AlertStore(APP_DIR).observe(account["id"], unread_ids,
+                    config.get("flash_until_clicked", False), config.get("flash_duration_seconds", 60))
                 notify_new(account, unread_ids, access_token)
                 messages, details_ready = read_details_cache(account["email"], unread_ids)
                 account["messages"] = messages
@@ -698,6 +702,7 @@ def remove_account(account_id: str) -> int:
     if account is None:
         emit({"ok": False, "error": "Account not found"})
         return 1
+    AlertStore(APP_DIR).remove(account_id)
     token_clear(account["email"])
     try:
         account_cache_path(account["email"]).unlink()
@@ -715,6 +720,13 @@ def main(argv: list[str]) -> int:
             emit(build_snapshot())
             return 0
         command, *args = argv
+        if command == "state" and not args:
+            emit(snapshot_result(load_config(), load_runtime_snapshot()))
+            return 0
+        if command == "ack-alert" and len(args) == 2:
+            AlertStore(APP_DIR).acknowledge(args[0], args[1])
+            emit(snapshot_result(load_config(), load_runtime_snapshot()))
+            return 0
         if command in ("update", "refresh"):
             emit(build_snapshot(force=True))
             return 0
@@ -747,3 +759,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+

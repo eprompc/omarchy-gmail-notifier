@@ -27,7 +27,7 @@ A lightweight personal Omarchy bar widget that checks multiple Gmail accounts wi
 - Messages outside Inbox, including snoozed mail, are excluded.
 - Accounts can be paused, resumed, silenced, or removed. Polling is adjustable from 1 to 60 minutes (2 minutes by default).
 - Settings support Spanish and English, use compact theme-styled buttons, and require an explicit confirmation before removing an account. The account label field has a visible outline. The panel starts at 376 px and can be resized in settings.
-- Each bar instance refreshes a local shared snapshot every 15 seconds. A process lock/cache ensures Gmail is contacted only once per configured polling interval, including on multi-monitor setups.
+- All monitors share alert generations and acknowledgements: clicking an account stops that alert everywhere. Local file watches propagate changes, with a five-second local-state fallback even when every account is paused. A process lock/cache ensures periodic Gmail polling happens only once per configured interval.
 - Google OAuth runs in the system default browser with PKCE and a loopback callback. Chrome/Chromium is not required; Zen Browser works when it is the default browser.
 
 ## Installation
@@ -94,10 +94,13 @@ After configuring `oauth-client.json`:
 1. Click the envelope icon in the bar to open the settings panel.
 2. Click **Add Gmail account**. Your default browser will open Google's authorization screen.
 3. Select and authorize each of your Gmail accounts (one by one).
-4. Tokens are securely stored in your desktop Secret Service; account settings are saved in `~/.config/omarchy/gmail-notifier/config.json`. The shared runtime snapshot and lock files are stored in `~/.config/omarchy/gmail-notifier/`, and header caches in `~/.cache/omarchy/gmail-notifier/`.
+4. Tokens are securely stored in your desktop Secret Service; account settings are saved in `~/.config/omarchy/gmail-notifier/config.json`. The shared runtime snapshot, alert state and lock files are stored in `~/.config/omarchy/gmail-notifier/`, and header caches in `~/.cache/omarchy/gmail-notifier/`.
 
 ## Privacy and polling
 
-The periodic Gmail query requests unread message IDs carrying both `INBOX` and `UNREAD`. It retrieves sender/subject headers only when the user opens an account list and never requests bodies, sends mail, changes labels, or marks messages read. Snoozed messages leave Inbox and are not counted.
+The periodic Gmail query requests unread message IDs carrying both `INBOX` and `UNREAD`. It retrieves sender/subject headers when the user opens an account list, and a subject for a new-mail desktop notification and never requests bodies, sends mail, changes labels, or marks messages read. Snoozed messages leave Inbox and are not counted.
 
-The displayed count changes at the next Gmail poll (2 minutes by default); local bars read the shared cached state every 15 seconds so monitors stay synchronized without multiplying Gmail API calls. New mail flashing starts when a poll detects a higher unread count.
+The displayed count changes at the next Gmail poll (2 minutes by default); local bars watch shared state files and read the cached state every five seconds as a fallback, without contacting Gmail. Each bar asks the poll helper for an update every 15 seconds; the shared cache enforces the configured Gmail interval. New mail flashing starts when a poll detects new unread message IDs after its initial baseline, even if the total count stays unchanged. A click acknowledges only the displayed alert, so a newer arrival remains visible.
+
+For branch installation, regression checks, desktop acceptance and rollback instructions, see [TESTING.md](TESTING.md).
+
