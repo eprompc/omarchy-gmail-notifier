@@ -34,6 +34,17 @@ function normalizedInitial(value, email) {
   return local.length > 0 ? local.substring(0, 1).toLocaleUpperCase() : "?"
 }
 
+// WidgetButton owns its tooltip Text item, so escape network-derived values
+// before handing them to Omarchy components that may use AutoText.
+function escapeMarkup(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+}
+
 
 // Shared timestamps keep all monitor instances on the same flash phase.
 function isAlertActive(alert, now) {
