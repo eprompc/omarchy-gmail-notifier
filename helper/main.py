@@ -431,8 +431,10 @@ def list_unread_ids(access_token: str) -> list[str]:
 
 
 def fetch_metadata(access_token: str, message_ids: list[str]) -> list[dict]:
+    if len(message_ids) > MAX_DETAIL_MESSAGES:
+        raise NotifierError("Too many unread messages to load safely; narrow the inbox and try again.")
     summaries: list[dict] = []
-    for message_id in message_ids[:MAX_DETAIL_MESSAGES]:
+    for message_id in message_ids:
         params = urllib.parse.urlencode([
             ("format", "metadata"),
             ("metadataHeaders", "From"),
