@@ -55,6 +55,19 @@ omarchy plugin remove eprom.gmail-notifier
 
 Requirements: Omarchy, `python3`, `secret-tool` (from `libsecret`), `notify-send` (from `libnotify`), and a working Secret Service in the desktop session.
 
+### Omarchy 4.5 compatibility
+
+The plugin uses Omarchy's schema 1 `bar-widget` contract and is compatible with Omarchy 4.5 (Quattro). Validate a checkout before enabling it:
+
+```bash
+omarchy plugin validate .
+python3 -m unittest discover -s tests -v
+node --test tests/model.test.cjs tests/manifest.test.cjs
+python3 -m compileall -q helper
+```
+
+The widget keeps Gmail polling and alert acknowledgements in shared local files so separate bar instances can converge across monitors. Account pausing disables that account's polling and notifications.
+
 ## Google OAuth setup
 
 The plugin reads a Google Desktop OAuth client configuration from:
