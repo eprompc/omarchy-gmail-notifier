@@ -27,3 +27,7 @@ test('Gmail snapshot output updates the visible model directly', () => {
   assert.match(process, /onStreamFinished:\s*\{\s*if \(text\.length > 0\) root\.receiveSnapshot\(text\)/);
   assert.doesNotMatch(process, /root\.actionFinished\(text\)/);
 });
+
+test('network-derived tooltip values are escaped before AutoText sinks', () => {
+  assert.equal(model.escapeMarkup('<img src="https://example.invalid/tracker"> & \'x\''), '&lt;img src=&quot;https://example.invalid/tracker&quot;&gt; &amp; &#39;x&#39;');
+});
