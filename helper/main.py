@@ -39,6 +39,7 @@ GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_UNREAD_IDS = 10000
 MAX_DETAIL_MESSAGES = 500
+MAX_HEADER_CHARS = 4096
 DEFAULT_CONFIG = {
     "version": 1,
     "poll_interval_minutes": 2,
@@ -435,9 +436,12 @@ def fetch_metadata(access_token: str, message_ids: list[str]) -> list[dict]:
             ("metadataHeaders", "Subject"),
         ])
         message = gmail_request(f"{message_url(message_id)}?{params}", access_token)
+        payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+        raw_headers = payload.get("headers", []) if isinstance(payload, dict) else []
         headers = {
-            str(header.get("name", "")).lower(): str(header.get("value", ""))
-            for header in message.get("payload", {}).get("headers", [])
+            str(header.get("name", "")).lower(): str(header.get("value", ""))[:MAX_HEADER_CHARS]
+            for header in raw_headers
+            if isinstance(header, dict)
         }
         summaries.append({
             "id": message_id,
