@@ -265,7 +265,10 @@ BarWidget {
     command: ["python3", root.helperPath, "snapshot"]
     stdout: StdioCollector {
       id: snapshotOutput
-      onStreamFinished: { if (text.length > 0) root.actionFinished(text) }
+      // A periodic/manual Gmail poll returns the fresh account snapshot.
+      // Do not route it through actionFinished(), which only schedules a
+      // local-state refresh and would leave the visible counts stale.
+      onStreamFinished: { if (text.length > 0) root.receiveSnapshot(text) }
     }
     onExited: function(exitCode) {
       if (exitCode !== 0 && snapshotOutput.text.length === 0)

@@ -21,3 +21,9 @@ test('acknowledged events remain silent even after widget recreation', () => {
 test('paused accounts and empty inboxes are hidden', () => {
   assert.equal(model.visibleAccounts([{enabled: false, unread_count: 5}, {unread_count: 0}]).length, 0);
 });
+test('Gmail snapshot output updates the visible model directly', () => {
+  const widget = fs.readFileSync('BarWidget.qml', 'utf8');
+  const process = widget.match(/id: snapshotProcess[\s\S]*?id: actionProcess/)[0];
+  assert.match(process, /onStreamFinished:\s*\{\s*if \(text\.length > 0\) root\.receiveSnapshot\(text\)/);
+  assert.doesNotMatch(process, /root\.actionFinished\(text\)/);
+});
