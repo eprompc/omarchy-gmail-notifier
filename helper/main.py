@@ -418,10 +418,13 @@ def list_unread_ids(access_token: str) -> list[str]:
             params.append(("pageToken", page_token))
         url = f"{GMAIL_API}/messages?{urllib.parse.urlencode(params)}"
         page = gmail_request(url, access_token)
-        unread_ids.extend(item.get("id") for item in page.get("messages", []) if isinstance(item, dict) and item.get("id"))
+        items = page.get("messages", [])
+        if not isinstance(items, list):
+            raise NotifierError("Google returned an unexpected message list.")
+        unread_ids.extend(item.get("id") for item in items if isinstance(item, dict) and item.get("id"))
         if len(unread_ids) > MAX_UNREAD_IDS:
             raise NotifierError("This account has too many unread messages to display safely.")
-        page_token = str(page.get("nextPageToken", ""))
+        page_token = str(page.get("nextPageToken", ""))[:512]
         if not page_token:
             break
     return unread_ids
