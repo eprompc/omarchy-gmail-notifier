@@ -343,9 +343,9 @@ BarWidget {
         labelVisible: false
         hasVisualContent: true
         fixedWidth: accountLabel.implicitWidth + scaledHorizontalMargin * 2
-        tooltipText: account.enabled === false
+        tooltipText: Model.escapeMarkup(account.enabled === false
           ? account.email + " — paused (click to manage)"
-          : account.email + " — " + Model.messageCount(account) + " unread"
+          : account.email + " — " + Model.messageCount(account) + " unread")
         onPressed: function(buttonCode) {
           root.stopFlashing(account.id)
           if (buttonCode === Qt.LeftButton) {
