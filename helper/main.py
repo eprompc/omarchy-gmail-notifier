@@ -36,6 +36,9 @@ CACHE_DIR = Path.home() / ".cache" / "omarchy" / "gmail-notifier"
 TOKEN_APP = "gmail-notifier"
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.metadata"
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_UNREAD_IDS = 10000
+MAX_DETAIL_MESSAGES = 500
 DEFAULT_CONFIG = {
     "version": 1,
     "poll_interval_minutes": 2,
@@ -177,6 +180,19 @@ def emit(data: dict) -> None:
     print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
 
+def read_json_response(response) -> dict:
+    payload = response.read(MAX_HTTP_RESPONSE_BYTES + 1)
+    if len(payload) > MAX_HTTP_RESPONSE_BYTES:
+        raise NotifierError("Google response was too large; the previous state is kept.")
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise NotifierError("Google returned an invalid JSON response.") from None
+    if not isinstance(value, dict):
+        raise NotifierError("Google returned an unexpected response.")
+    return value
+
+
 def api_json(url: str, access_token: str) -> dict:
     request = urllib.request.Request(
         url,
@@ -184,7 +200,7 @@ def api_json(url: str, access_token: str) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return read_json_response(response)
     except urllib.error.HTTPError as error:
         if error.code == 401:
             raise NotifierError("Google authorization expired; reconnect this account.") from None
@@ -243,7 +259,7 @@ def token_request(form: dict) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return read_json_response(response)
     except urllib.error.HTTPError as error:
         raise NotifierError(f"Google OAuth returned HTTP {error.code}.") from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
@@ -401,7 +417,9 @@ def list_unread_ids(access_token: str) -> list[str]:
             params.append(("pageToken", page_token))
         url = f"{GMAIL_API}/messages?{urllib.parse.urlencode(params)}"
         page = gmail_request(url, access_token)
-        unread_ids.extend(item["id"] for item in page.get("messages", []) if item.get("id"))
+        unread_ids.extend(item.get("id") for item in page.get("messages", []) if isinstance(item, dict) and item.get("id"))
+        if len(unread_ids) > MAX_UNREAD_IDS:
+            raise NotifierError("This account has too many unread messages to display safely.")
         page_token = str(page.get("nextPageToken", ""))
         if not page_token:
             break
@@ -410,7 +428,7 @@ def list_unread_ids(access_token: str) -> list[str]:
 
 def fetch_metadata(access_token: str, message_ids: list[str]) -> list[dict]:
     summaries: list[dict] = []
-    for message_id in message_ids:
+    for message_id in message_ids[:MAX_DETAIL_MESSAGES]:
         params = urllib.parse.urlencode([
             ("format", "metadata"),
             ("metadataHeaders", "From"),
