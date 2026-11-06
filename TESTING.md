@@ -1,6 +1,6 @@
-# Validate 0.3.0 before release
+# Testing and acceptance for 0.3.0
 
-This branch is a release candidate. Automated checks use synthetic data and never authenticate to Google. Runtime dependencies are documented in README.md.
+The owner accepted the 0.3.0 desktop test on 2026-11-06; see ACCEPTANCE.md for the tested revision and scope. The checklist below is retained for reproducible future release checks. Automated checks use synthetic data and never authenticate to Google. Runtime dependencies are documented in README.md.
 
 ## Automated checks
 
@@ -38,7 +38,7 @@ The normal Omarchy plugin updater fetches the default branch (`main`), not this 
 
 ## Required desktop acceptance
 
-Record the exact commit, Omarchy version, monitor count and scale factors. The repository owner reported successful routine testing of the previous version; this candidate changes IPC and needs its own acceptance record.
+For future test reports, record the exact commit, Omarchy version, monitor count and scale factors. The 0.3.0 owner report is recorded in ACCEPTANCE.md; the reusable checklist below does not imply a separate automated verification of every visual variant.
 
 - [ ] Validate and load in Omarchy 4.5 without QML import/runtime errors.
 - [ ] Update an existing installation without authorizing again. Verify unchanged accounts, order, initials, switches, language and layout; roll back and verify authorization still works. Separately authorize a new test account and cancel one authorization attempt.

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 — candidate
+## 0.3.0 — 2026-11-06
 
 - Deliver notifications through Gio D-Bus inside the helper process; access credentials with libsecret in process; preserve and synchronize legacy entries for updates and rollback.
 - Preserve account initials, sender and subject in transient desktop notifications without placing them in child-process arguments.
