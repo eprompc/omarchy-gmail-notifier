@@ -9,6 +9,8 @@ python3 -m unittest discover -s tests -v
 node --test tests/*.test.cjs
 python3 -m compileall -q helper
 dbus-run-session -- /usr/bin/python3 tests/dbus_integration.py
+# Optional integration dependency: gnome-keyring, used only with a temporary empty keyring.
+dbus-run-session -- /usr/bin/python3 tests/secret_integration.py
 omarchy plugin validate .
 ```
 

@@ -4,7 +4,7 @@ Candidate 0.3.0 follows the audit of main at 5adaad8. “Implemented” means co
 
 | Task | Implementation | Evidence / remaining check |
 |---|---|---|
-| 7 Private notification transport | Implemented: Gio D-Bus and libsecret in process; no private argv in widget requests | Real isolated notification server; desktop/legacy Secret Service acceptance pending |
+| 7 Private notification transport | Implemented: Gio D-Bus and libsecret in process; no private argv in widget requests | Real isolated notification server and CI keyring migration check; desktop acceptance pending |
 | 8 Ordered synchronization | Implemented: one ordered stream with epoch/revision per service | Stale snapshot rejection and two persistent client integration |
 | 9 Concurrent settings | Implemented: owner-only short transaction, atomic files, lifecycle generation checks | Multiprocess edits and pause during poll tests |
 | 10 Reattempts and queued actions | Implemented: explicit details retry and bounded queue | No automatic repeated details; actions processed sequentially |
