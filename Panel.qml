@@ -35,6 +35,10 @@ Panel {
     path: Color.currentThemePath + "/colors.toml"
     printErrors: false
     watchChanges: true
+    onPathChanged: {
+      root.themeGreen = Color.accent
+      root.themeRed = Color.urgent
+    }
     onFileChanged: reload()
     onLoaded: {
       root.themeGreen = Color.accent
