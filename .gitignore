@@ -4,6 +4,7 @@ __pycache__/
 .env
 oauth-client.json
 config.json
+config.backup.json
 token.json
 snapshot.json
 snapshot.lock

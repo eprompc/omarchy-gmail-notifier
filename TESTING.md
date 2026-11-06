@@ -1,97 +1,62 @@
-# Testing the multi-monitor branch
+# Validate 0.3.0 before release
 
-This branch is experimental. Keep the pull request in draft until the desktop
-checks below pass. Automated tests do not start Omarchy or authenticate to Google.
+This branch is a release candidate. Automated checks use synthetic data and never authenticate to Google. Runtime dependencies are documented in README.md.
 
-## Automated regression checks
+## Automated checks
 
 ```bash
 python3 -m unittest discover -s tests -v
-node --test tests/model.test.cjs
+node --test tests/*.test.cjs
 python3 -m compileall -q helper
+dbus-run-session -- /usr/bin/python3 tests/dbus_integration.py
+omarchy plugin validate .
 ```
 
-These cover shared alert generations, acknowledgement from another process,
-concurrent clicks, delayed clicks after new mail, equal-count message replacement,
-expiration, pause filtering, removal and local reads while the Gmail lock is held.
-JavaScript checks cover shared activity and flash phase. GitHub Actions runs these
-checks on pull requests and pushes to main and fix branches.
+Use a system Python with PyGObject for the D-Bus test. CI installs its dependencies only on the disposable GitHub Actions runner. The plugin does not contain a package installer. Qt 6 parses both QML files in CI; the JavaScript tests execute the widget's actual response/queue functions without a compositor. These checks do not constitute a rendered Omarchy acceptance test.
 
-## How Omarchy updates this plugin
+The D-Bus test owns a fake notification server on an isolated session bus. It verifies typed delivery, transient hints and the absence of child process invocation. Other tests exercise two persistent widget clients, shared state revisions, acknowledgement during blocked network work, concurrent configuration edits, 501-message pagination, invalid state/Google data, and notification failure without losing counts.
 
-The upstream `omacom/omarchy` scripts on branch `quattro`, inspected on 2026-11-04,
-clone the repository's default branch. `bin/omarchy-plugin-update` runs
-`git fetch origin HEAD` and fast-forwards to `FETCH_HEAD`; it does not select a
-GitHub release or the locally checked-out development branch. The default branch
-of this repository is `main`. Publishing a branch or draft PR therefore does not
-offer its changes through the normal updater. Merging to main does.
+## Try the candidate
 
-Do not use `omarchy plugin update` while testing a development checkout: it still
-targets the remote default HEAD. Do not change the repository default branch.
-Your installed Omarchy version may differ; inspect its update script if needed.
-
-Sources:
-- https://github.com/omacom/omarchy/blob/quattro/bin/omarchy-plugin-add
-- https://github.com/omacom/omarchy/blob/quattro/bin/omarchy-plugin-update
-
-## Try the branch on your desktop
-
-The CLI currently has no branch flag for `plugin add`. Use the existing installed
-checkout. The commands below require its current branch to be `main` and the
-checkout to have no uncommitted changes. Stop if either check differs; preserve
-your edits before switching versions. Do not install a second copy with the same
-plugin ID.
+Use the existing installed checkout, preserve any uncommitted changes first, and stop if `git status --short` is not empty. Do not install two copies with the same plugin ID.
 
 ```bash
 cd ~/.config/omarchy/plugins/eprom.gmail-notifier
 git status --short
-git branch --show-current
-git fetch origin fix/multi-monitor
+git fetch origin fix/privacy-reliability-45
 omarchy plugin disable eprom.gmail-notifier
-git switch --detach origin/fix/multi-monitor
+git switch --detach origin/fix/privacy-reliability-45
 omarchy plugin validate .
 omarchy plugin enable eprom.gmail-notifier
 ```
 
-Use the already configured Gmail accounts. The first successful poll establishes
-the new alert baseline; existing unread mail should not flash just because you
-installed the branch. This version adds `alerts.json` and `alerts.lock` alongside
-the existing configuration; it does not migrate OAuth tokens or the config schema.
-Do not attach these personal runtime files to issues or PRs.
+Use the existing OAuth client and accounts. Installing the new dependencies does not require new Google scopes. The first successful use migrates existing secret entries to hashed keys inside Secret Service. The previous version can therefore require reauthorizing accounts after rollback; do not delete tokens or personal state as part of testing. Configuration IDs are retained for existing accounts.
 
-To return to the stable checkout, disable the plugin, switch back and enable it:
+The normal Omarchy plugin updater fetches the default branch (`main`), not this candidate. Do not run it while trying the candidate.
+
+## Required desktop acceptance
+
+Record the exact commit, Omarchy version, monitor count and scale factors. The repository owner reported successful routine testing of the previous version; this candidate changes IPC and needs its own acceptance record.
+
+- [ ] Validate and load in Omarchy 4.5 without QML import/runtime errors.
+- [ ] Authorize a new account and read an existing legacy authorization; cancel one authorization attempt.
+- [ ] Receive a synthetic email. Verify account initials in the title, sender in bold, subject below, theme appearance, DND and alert disabling.
+- [ ] With synthetic notification data, inspect process command lines during delivery: no sender, subject, account address, or token should appear in newly launched desktop helper commands.
+- [ ] On two/three monitors, receive new mail, acknowledge on each monitor, test a new arrival concurrent with a click, disconnect/reconnect a monitor, and restart the shell.
+- [ ] Pause/resume and edit settings simultaneously on different monitors. Remove a test account during an active request.
+- [ ] Open an inbox with more than 500 unread messages; load subsequent pages, test a message deleted during loading, and interrupt connectivity. Confirm no repeating error loop.
+- [ ] Change system language, test English/Spanish overrides, a different theme, keyboard navigation and mixed scaling.
+- [ ] With no new mail, confirm the service and persistent clients remain running without recurring process launches. With all widgets disabled, confirm service exit after 60 idle seconds.
+
+## Rollback
 
 ```bash
 cd ~/.config/omarchy/plugins/eprom.gmail-notifier
 omarchy plugin disable eprom.gmail-notifier
 git switch main
+git pull --ff-only origin main
 omarchy plugin validate .
 omarchy plugin enable eprom.gmail-notifier
 ```
 
-## Desktop acceptance checklist (required before merging)
-
-Record the Omarchy version, monitor count, scaling and PR commit tested.
-
-- [ ] Validate the plugin and enable it on two and three monitors without QML errors.
-- [ ] After the baseline poll, receive mail: all badges show the same count and
-      share the same flash timing. Repeat with desktop notifications disabled.
-- [ ] Click a flashing account on each monitor in turn: all copies stop. Verify
-      propagation normally follows the file-change event; the local fallback is
-      five seconds if an event is missed.
-- [ ] Test both timed flashing and flash-until-clicked. Opening another monitor
-      or restarting the widget must not restart an acknowledged or expired alert.
-- [ ] Receive a new email at the same time as a click. The click only acknowledges
-      the displayed event; the newer event remains active.
-- [ ] Read/archive one unread email and receive a different one between polls:
-      the unchanged unread count must still produce a new alert.
-- [ ] Pause all accounts on one monitor and resume on another; also remove all
-      accounts and add one. Every monitor must pick up those local changes.
-- [ ] Open a long unread list or interrupt networking while another alert is
-      flashing; acknowledging it must not wait for the Gmail request to finish.
-- [ ] Disconnect/reconnect a monitor, restart the shell, and test mixed scaling.
-- [ ] Return to main and verify the stable widget still works.
-
-Configuration write concurrency, header pagination, broader error recovery and
-OAuth diagnostics remain separate follow-up tasks. This PR specifically changes
-shared alert state and monitor synchronization.
+Preserve config.json and its private backup. Do not post OAuth files, socket payloads, tokens, account configurations or real snapshots in issues. Use synthetic metadata for reports.

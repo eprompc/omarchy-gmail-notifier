@@ -14,10 +14,10 @@ import fcntl
 import hashlib
 import http.server
 import json
+import math
 from html import escape
 import os
 import secrets
-import subprocess
 import sys
 import tempfile
 import time
@@ -27,6 +27,11 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 from alerts import AlertStore
+from contextlib import contextmanager
+import hmac
+import threading
+import desktop
+from storage import StorageError, locked, read_object, atomic_write, private_directory
 
 
 APP_DIR = Path.home() / ".config" / "omarchy" / "gmail-notifier"
@@ -40,7 +45,11 @@ GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.metadata"
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_UNREAD_IDS = 10000
-MAX_DETAIL_MESSAGES = 500
+MAX_DETAIL_MESSAGES = 50
+MAX_ACCOUNTS = 32
+NETWORK_CONTEXT = threading.local()
+AUTH_CANCELLED = threading.Event()
+OUTPUT = threading.local()
 MAX_HEADER_CHARS = 4096
 DEFAULT_CONFIG = {
     "version": 1,
@@ -53,104 +62,160 @@ DEFAULT_CONFIG = {
 
 
 class NotifierError(Exception):
-    pass
+    def __init__(self, message, retry_after=0):
+        super().__init__(message)
+        self.retry_after = min(3600, max(0, retry_after))
 
 
 def load_config() -> dict:
-    try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("configuration root must be an object")
-    except FileNotFoundError:
-        data = dict(DEFAULT_CONFIG)
-    data.setdefault("version", 1)
-    data.setdefault("poll_interval_minutes", 2)
-    data.setdefault("flash_duration_seconds", 60)
-    data.setdefault("flash_until_clicked", False)
-    data.setdefault("font_size_offset", 0)
-    data.setdefault("panel_width", 376)
-    data.setdefault("language", "en")
-    if data["language"] not in {"es", "en"}:
-        data["language"] = "en"
-    data.setdefault("accounts", [])
-    if not isinstance(data["accounts"], list):
-        data["accounts"] = []
-    try:
-        data["poll_interval_minutes"] = max(1, min(60, int(data["poll_interval_minutes"])))
-    except (TypeError, ValueError):
-        data["poll_interval_minutes"] = 2
-    try:
-        data["flash_duration_seconds"] = max(5, min(600, int(data.get("flash_duration_seconds", 60))))
-    except (TypeError, ValueError):
-        data["flash_duration_seconds"] = 60
-    data["flash_until_clicked"] = bool(data.get("flash_until_clicked", False))
-    try:
-        data["font_size_offset"] = max(-2, min(8, int(data["font_size_offset"])))
-    except (TypeError, ValueError):
-        data["font_size_offset"] = 0
-    try:
-        data["panel_width"] = max(360, min(720, int(data["panel_width"])))
-    except (TypeError, ValueError):
-        data["panel_width"] = 376
+    data = read_object(CONFIG_PATH, missing=None, limit=1024 * 1024)
+    if data is None:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data['language'] = 'auto'
+    if not isinstance(data.get('accounts', []), list) or len(data.get('accounts', [])) > MAX_ACCOUNTS:
+        raise StorageError('Invalid account list; restore config.json from a valid backup.')
+    defaults = {'poll_interval_minutes': (2, 1, 60), 'flash_duration_seconds': (60, 5, 600),
+                'font_size_offset': (0, -2, 8), 'panel_width': (376, 360, 720)}
+    for name, (default, lower, upper) in defaults.items():
+        value = data.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise StorageError('Invalid display settings in config.json.')
+        data[name] = max(lower, min(upper, value))
+    data.setdefault('version', 1)
+    if data['version'] != 1:
+        raise StorageError('Unsupported configuration version; keep this file and use a compatible release.')
+    data.setdefault('flash_until_clicked', False)
+    data.setdefault('language', 'auto')
+    if data['language'] not in ('auto', 'es', 'en') or not isinstance(data['flash_until_clicked'], bool):
+        raise StorageError('Invalid language or alert settings in config.json.')
+    data.setdefault('accounts', [])
+    ids = set()
+    for account in data['accounts']:
+        if not isinstance(account, dict):
+            raise StorageError('Invalid account entry in config.json.')
+        for field in ('id', 'email'):
+            value = account.get(field)
+            if not isinstance(value, str) or not value or len(value) > 320 or any(ord(c) < 32 for c in value):
+                raise StorageError('Invalid account identity in config.json.')
+        if account['id'] in ids:
+            raise StorageError('Duplicate account identity in config.json.')
+        ids.add(account['id'])
+        for field in ('last_notification_ids',):
+            items = account.get(field, [])
+            if not isinstance(items, list) or len(items) > MAX_UNREAD_IDS or not all(isinstance(i, str) for i in items):
+                raise StorageError('Invalid notification history in config.json.')
+        account.setdefault('generation', 'legacy')
+        if not isinstance(account['generation'], str) or len(account['generation']) > 64:
+            raise StorageError('Invalid account generation in config.json.')
+        account.setdefault('initial', '?')
+        if not isinstance(account['initial'], str) or len(account['initial']) > 7 or any(ord(c) < 32 for c in account['initial']):
+            raise StorageError('Invalid account label in config.json.')
+        for name in ('enabled', 'notifications'):
+            account.setdefault(name, True)
+            if not isinstance(account[name], bool):
+                raise StorageError('Invalid account switch in config.json.')
     return data
 
 
 def save_config(data: dict) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(APP_DIR, 0o700)
-    fd, tmp_name = tempfile.mkstemp(prefix=".config-", dir=APP_DIR)
+    persisted = copy.deepcopy(data)
+    for account in persisted.get('accounts', []):
+        for key in ('messages', 'last_error', 'notification_error', 'details_ready', 'unread_count',
+                    'unread_ids', 'details_more', 'details_loaded', 'details_error', 'retry_at', 'failures'):
+            account.pop(key, None)
+    previous = read_object(CONFIG_PATH)
+    if previous == persisted:
+        return
+    if previous is not None:
+        atomic_write(APP_DIR / 'config.backup.json', previous)
+    atomic_write(CONFIG_PATH, persisted)
+
+
+@contextmanager
+def config_transaction():
+    with locked(APP_DIR / 'config.lock'):
+        config = load_config()
+        yield config
+        save_config(config)
+
+
+@contextmanager
+def network_budget(seconds=60):
+    previous = getattr(NETWORK_CONTEXT, 'deadline', None)
+    NETWORK_CONTEXT.deadline = time.monotonic() + seconds
     try:
-        persisted = copy.deepcopy(data)
-        for account in persisted.get("accounts", []):
-            for transient in ("messages", "last_error", "details_ready", "unread_count"):
-                account.pop(transient, None)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(persisted, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, CONFIG_PATH)
+        yield
     finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
+        NETWORK_CONTEXT.deadline = previous
+
+
+def request_timeout():
+    deadline = getattr(NETWORK_CONTEXT, 'deadline', None)
+    remaining = deadline - time.monotonic() if deadline else 20
+    if remaining <= 0:
+        raise NotifierError('Google operation timed out; retry when ready.')
+    return min(20, remaining)
+
+
+def valid_runtime_account(account):
+    count = account.get('unread_count', 0)
+    if not isinstance(count, int) or not 0 <= count <= MAX_UNREAD_IDS:
+        return False
+    ids = account.get('unread_ids', [])
+    if not isinstance(ids, list) or len(ids) > MAX_UNREAD_IDS or not all(isinstance(i, str) for i in ids):
+        return False
+    messages = account.get('messages', [])
+    if not isinstance(messages, list) or len(messages) > MAX_UNREAD_IDS:
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or not all(isinstance(message.get(k), str) for k in ('id', 'from', 'subject')):
+            return False
+    for key in ('retry_at', 'failures'):
+        value = account.get(key, 0)
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            return False
+    return True
 
 
 def load_runtime_snapshot() -> dict | None:
     try:
-        data = json.loads(SNAPSHOT_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except (FileNotFoundError, json.JSONDecodeError):
+        value = read_object(SNAPSHOT_PATH)
+        if value is not None and (not isinstance(value.get('accounts'), list)
+                                  or not all(isinstance(a, dict) for a in value.get('accounts', []))
+                                  or not isinstance(value.get('checked_at'), (int, float))
+                                  or not math.isfinite(value['checked_at'])
+                                  or not 0 <= value['checked_at'] <= time.time() + 60
+                                  or not all(valid_runtime_account(a) for a in value.get('accounts', []))):
+            return None
+        return value
+    except StorageError:
         return None
 
 
 def save_runtime_snapshot(accounts: list[dict], checked_at: float) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(APP_DIR, 0o700)
-    fd, tmp_name = tempfile.mkstemp(prefix=".snapshot-", dir=APP_DIR)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump({"checked_at": checked_at, "accounts": accounts}, stream, ensure_ascii=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, SNAPSHOT_PATH)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
+    accounts = copy.deepcopy(accounts)
+    value = {'checked_at': checked_at, 'accounts': accounts}
+    while len(json.dumps(value, ensure_ascii=False).encode('utf-8')) > 8 * 1024 * 1024:
+        largest = max(accounts, key=lambda a: len(a.get('messages', [])), default={})
+        messages = largest.get('messages', [])
+        if not messages:
+            raise NotifierError('Shared state limit reached; reduce the unread inbox.')
+        largest['messages'] = messages[:len(messages) // 2]
+        largest['details_loaded'] = len(largest['messages'])
+        largest['details_more'] = True
+    atomic_write(SNAPSHOT_PATH, value)
 
 
 def merge_runtime_accounts(config: dict, snapshot: dict | None) -> list[dict]:
     cached = {a.get("id"): a for a in (snapshot or {}).get("accounts", []) if a.get("id")}
     merged = []
-    transient = ("messages", "unread_count", "details_ready", "last_error")
+    transient = ("messages", "unread_count", "details_ready", "last_error", "notification_error",
+                 "unread_ids", "details_more", "details_loaded", "details_error", "retry_at", "failures")
     for configured in config["accounts"]:
         account = copy.deepcopy(configured)
         previous = cached.get(account.get("id"), {})
+        if previous.get("generation", "legacy") != account.get("generation", "legacy"):
+            previous = {}
         for key in transient:
             if key in previous:
                 account[key] = previous[key]
@@ -163,7 +228,10 @@ def merge_runtime_accounts(config: dict, snapshot: dict | None) -> list[dict]:
 
 def snapshot_result(config: dict, snapshot: dict | None) -> dict:
     accounts = merge_runtime_accounts(config, snapshot)
-    errors = [f"{a.get('email', 'Account')}: {a['last_error']}" for a in accounts if a.get("last_error")]
+    for account in accounts:
+        account.pop("unread_ids", None)
+    errors = [f"{a.get('initial', 'Account')}: {a.get('last_error') or a.get('notification_error') or a.get('details_error')}"
+              for a in accounts if a.get("last_error") or a.get("notification_error") or a.get("details_error")]
     return {
         "ok": True,
         "alerts": AlertStore(APP_DIR).visible(accounts),
@@ -174,13 +242,18 @@ def snapshot_result(config: dict, snapshot: dict | None) -> dict:
         "font_size_offset": config["font_size_offset"],
         "panel_width": config["panel_width"],
         "language": config["language"],
+        "effective_language": effective_language(config["language"]),
         "oauth_ready": OAUTH_CLIENT_PATH.is_file(),
         "error": "; ".join(errors),
     }
 
 
 def emit(data: dict) -> None:
-    print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+    sink = getattr(OUTPUT, "sink", None)
+    if sink:
+        sink(data)
+    else:
+        print(json.dumps(data, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
 def read_json_response(response) -> dict:
@@ -196,61 +269,74 @@ def read_json_response(response) -> dict:
     return value
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, url):
+        return None
+
+
+def safe_open(request):
+    parsed = urllib.parse.urlparse(request.full_url)
+    if parsed.scheme != 'https' or parsed.hostname not in ('gmail.googleapis.com', 'oauth2.googleapis.com'):
+        raise NotifierError('Refused unexpected Google endpoint.')
+    return urllib.request.build_opener(NoRedirect()).open(request, timeout=request_timeout())
+
+
 def api_json(url: str, access_token: str) -> dict:
     request = urllib.request.Request(
         url,
         headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with safe_open(request) as response:
             return read_json_response(response)
     except urllib.error.HTTPError as error:
         if error.code == 401:
             raise NotifierError("Google authorization expired; reconnect this account.") from None
         if error.code == 403:
             raise NotifierError("Gmail denied metadata access; check the OAuth consent and Gmail API.") from None
-        raise NotifierError(f"Gmail API returned HTTP {error.code}.") from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        retry_after = error.headers.get('Retry-After', '60')
+        try:
+            retry_after = int(retry_after)
+        except (TypeError, ValueError):
+            retry_after = 60
+        raise NotifierError(f"Gmail API returned HTTP {error.code}.", retry_after if error.code in (429, 503) else 0) from None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         raise NotifierError("Could not reach Gmail. The last saved count is kept.") from None
 
 
-def token_lookup(email: str) -> dict:
-    result = subprocess.run(
-        ["secret-tool", "lookup", "application", TOKEN_APP, "account", email],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        raise NotifierError("No saved Google authorization for this account.")
+def token_lookup(email: str, generation=None) -> dict:
     try:
-        token = json.loads(result.stdout)
-        if not isinstance(token, dict) or not token.get("refresh_token"):
-            raise ValueError
+        # Migration must share the removal lock so it cannot recreate a cleared secret.
+        with config_transaction() as config:
+            account = next((a for a in config['accounts'] if a['email'] == email and a['enabled']), None)
+            if account is None or (generation is not None and account.get('generation') != generation):
+                raise NotifierError('Account was removed, paused or replaced.')
+            token = desktop.lookup(email)
+        if not isinstance(token, dict) or not isinstance(token.get('refresh_token'), str) or not token['refresh_token']:
+            raise NotifierError('No valid saved Google authorization; reconnect this account.')
+        if not isinstance(token.get('expires_at', 0), (int, float)) or not 0 <= token.get('expires_at', 0) < 1e12:
+            raise NotifierError('No valid saved Google authorization; reconnect this account.')
         return token
-    except (json.JSONDecodeError, ValueError):
-        raise NotifierError("Saved authorization is invalid; reconnect this account.") from None
+    except NotifierError:
+        raise
+    except RuntimeError as error:
+        raise NotifierError(str(error)) from error
+    except Exception as error:
+        raise NotifierError('Secret Service is unavailable or locked; unlock it and retry.') from error
 
 
 def token_store(email: str, token: dict) -> None:
-    result = subprocess.run(
-        ["secret-tool", "store", "--label=Gmail Notifier account token", "application", TOKEN_APP, "account", email],
-        input=json.dumps(token),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise NotifierError("Secret Service could not store the Google authorization.")
+    try:
+        desktop.store(email, token)
+    except Exception as error:
+        raise NotifierError('Secret Service could not store authorization.') from error
 
 
 def token_clear(email: str) -> None:
-    subprocess.run(
-        ["secret-tool", "clear", "application", TOKEN_APP, "account", email],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        desktop.clear(email)
+    except Exception as error:
+        raise NotifierError('Secret Service could not remove authorization; account was retained.') from error
 
 
 def token_request(form: dict) -> dict:
@@ -261,16 +347,21 @@ def token_request(form: dict) -> dict:
         headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            return read_json_response(response)
+        with safe_open(request) as response:
+            token = read_json_response(response)
+            access = token.get('access_token')
+            lifetime = token.get('expires_in', 3600)
+            if not isinstance(access, str) or not access or len(access) > 16384 or isinstance(lifetime, bool) or not isinstance(lifetime, int) or not 1 <= lifetime <= 86400:
+                raise NotifierError('Google returned an invalid access token response.')
+            return token
     except urllib.error.HTTPError as error:
         raise NotifierError(f"Google OAuth returned HTTP {error.code}.") from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         raise NotifierError("Could not reach Google OAuth.") from None
 
 
-def refresh_access_token(email: str, token: dict) -> tuple[str, dict]:
-    if float(token.get("expires_at", 0)) > time.time() + 60 and token.get("access_token"):
+def refresh_access_token(email: str, token: dict, generation=None) -> tuple[str, dict]:
+    if float(token.get("expires_at", 0)) > time.time() + 60 and isinstance(token.get("access_token"), str):
         return str(token["access_token"]), token
     client = read_oauth_client()
     form = {
@@ -281,9 +372,15 @@ def refresh_access_token(email: str, token: dict) -> tuple[str, dict]:
     if client.get("client_secret"):
         form["client_secret"] = client["client_secret"]
     refreshed = token_request(form)
+    if not isinstance(refreshed.get('access_token'), str) or not refreshed['access_token']:
+        raise NotifierError('Google did not return a valid access token.')
     token["access_token"] = refreshed["access_token"]
-    token["expires_at"] = time.time() + int(refreshed.get("expires_in", 3600))
-    token_store(email, token)
+    token["expires_at"] = time.time() + max(60, min(86400, int(refreshed.get("expires_in", 3600))))
+    with config_transaction() as config:
+        account = next((a for a in config['accounts'] if a['email'] == email and a['enabled']), None)
+        if account is None or (generation is not None and account.get('generation') != generation):
+            raise NotifierError('Account was removed, paused or replaced during authorization refresh.')
+        token_store(email, token)
     return str(token["access_token"]), token
 
 
@@ -293,14 +390,14 @@ def read_oauth_client() -> dict:
         installed = data.get("installed", {})
         client_id = installed.get("client_id")
         client_secret = installed.get("client_secret", "")
-        if not client_id:
+        if not isinstance(client_id, str) or not client_id or len(client_id) > 1024 or not isinstance(client_secret, str):
             raise ValueError
         return {"client_id": client_id, "client_secret": client_secret}
     except FileNotFoundError:
         raise NotifierError(
             "Set up a Google Desktop OAuth client at ~/.config/omarchy/gmail-notifier/oauth-client.json first."
         ) from None
-    except (json.JSONDecodeError, AttributeError, ValueError):
+    except (json.JSONDecodeError, AttributeError, ValueError, TypeError):
         raise NotifierError("The OAuth client file is invalid; use a Google Desktop app JSON.") from None
 
 
@@ -309,15 +406,24 @@ class OAuthCallback(http.server.BaseHTTPRequestHandler):
     result: dict = {}
 
     def do_GET(self) -> None:  # noqa: N802
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        if query.get("state", [""])[0] != self.expected_state:
-            type(self).result = {"error": "state_mismatch"}
-            body = b"Authorization state did not match. You can close this tab."
+        url = urllib.parse.urlparse(self.path)
+        try:
+            query = urllib.parse.parse_qs(url.query, max_num_fields=10)
+        except ValueError:
+            self.send_error(400, 'Invalid authorization request')
+            return
+        if url.path != '/' or not hmac.compare_digest(query.get('state', [''])[0].encode('utf-8'), self.expected_state.encode('utf-8')):
+            self.send_error(400, 'Unrelated authorization request')
+            return
         elif query.get("error"):
             type(self).result = {"error": query["error"][0]}
             body = b"Google authorization was not completed. You can close this tab."
         else:
-            type(self).result = {"code": query.get("code", [""])[0]}
+            code = query.get('code', [''])[0]
+            if not code or len(code) > 8192:
+                self.send_error(400, 'Invalid authorization code')
+                return
+            type(self).result = {"code": code}
             body = b"Google authorization was received. Return to Omarchy to confirm Gmail access and finish connecting the account."
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -330,6 +436,12 @@ class OAuthCallback(http.server.BaseHTTPRequestHandler):
 
 
 def authorize_account() -> int:
+    AUTH_CANCELLED.clear()
+    try:
+        with desktop.secret_api():
+            pass
+    except (RuntimeError, ImportError, ValueError) as error:
+        raise NotifierError(str(error)) from error
     client = read_oauth_client()
     APP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(APP_DIR, 0o700)
@@ -338,7 +450,12 @@ def authorize_account() -> int:
     state = secrets.token_urlsafe(32)
     OAuthCallback.expected_state = state
     OAuthCallback.result = {}
-    server = http.server.HTTPServer(("127.0.0.1", 0), OAuthCallback)
+    class CallbackServer(http.server.HTTPServer):
+        def get_request(self):
+            connection, address = super().get_request()
+            connection.settimeout(2)
+            return connection, address
+    server = CallbackServer(("127.0.0.1", 0), OAuthCallback)
     server.timeout = 1
     redirect_uri = f"http://127.0.0.1:{server.server_port}/"
     params = {
@@ -358,7 +475,7 @@ def authorize_account() -> int:
         raise NotifierError("Could not open the default browser for Google authorization.")
     deadline = time.monotonic() + 300
     try:
-        while not OAuthCallback.result and time.monotonic() < deadline:
+        while not OAuthCallback.result and time.monotonic() < deadline and not AUTH_CANCELLED.is_set():
             server.handle_request()
     finally:
         server.server_close()
@@ -377,28 +494,24 @@ def authorize_account() -> int:
     if client.get("client_secret"):
         form["client_secret"] = client["client_secret"]
     token = token_request(form)
-    if not token.get("refresh_token"):
+    if not isinstance(token.get("refresh_token"), str) or not isinstance(token.get("access_token"), str):
         raise NotifierError("Google did not return a refresh token; revoke the app grant and authorize again.")
     profile = api_json(f"{GMAIL_API}/profile", token["access_token"])
     email = str(profile.get("emailAddress", "")).strip().lower()
     if not email:
         raise NotifierError("Google did not return the Gmail account address.")
-    token["expires_at"] = time.time() + int(token.get("expires_in", 3600))
-    token_store(email, token)
-    config = load_config()
-    existing = next((a for a in config["accounts"] if a.get("email", "").lower() == email), None)
-    if not existing:
-        config["accounts"].append({
-            "id": email,
-            "email": email,
-            "initial": email[:1].upper(),
-            "enabled": True,
-            "notifications": True,
-            "last_notification_ids": [],
-            "messages": [],
-            "unread_count": 0,
-        })
-    save_config(config)
+    token["expires_at"] = time.time() + max(60, min(86400, int(token.get("expires_in", 3600))))
+    with config_transaction() as config:
+        existing = next((a for a in config['accounts'] if a['email'].lower() == email), None)
+        if existing is None and len(config['accounts']) >= MAX_ACCOUNTS:
+            raise NotifierError('Maximum configured account count reached.')
+        token_store(email, token)
+        if existing is None:
+            config['accounts'].append({
+                'id': secrets.token_hex(16), 'email': email, 'generation': secrets.token_hex(16),
+                'initial': email[:1].upper(), 'enabled': True, 'notifications': True,
+                'last_notification_ids': [],
+            })
     return 0
 
 
@@ -411,25 +524,32 @@ def message_url(message_id: str) -> str:
 
 
 def list_unread_ids(access_token: str) -> list[str]:
-    """List unread inbox message IDs only; this is the periodic low-cost poll."""
-    unread_ids: list[str] = []
-    page_token = ""
-    while True:
-        params = [("labelIds", "INBOX"), ("labelIds", "UNREAD"), ("maxResults", "500")]
+    unread_ids, seen_ids, seen_pages = [], set(), set()
+    page_token = ''
+    for _ in range(25):
+        params = [('labelIds', 'INBOX'), ('labelIds', 'UNREAD'), ('maxResults', '500')]
         if page_token:
-            params.append(("pageToken", page_token))
-        url = f"{GMAIL_API}/messages?{urllib.parse.urlencode(params)}"
-        page = gmail_request(url, access_token)
-        items = page.get("messages", [])
-        if not isinstance(items, list):
-            raise NotifierError("Google returned an unexpected message list.")
-        unread_ids.extend(item.get("id") for item in items if isinstance(item, dict) and item.get("id"))
+            params.append(('pageToken', page_token))
+        page = gmail_request(f'{GMAIL_API}/messages?{urllib.parse.urlencode(params)}', access_token)
+        items = page.get('messages', [])
+        if not isinstance(items, list) or len(items) > 500:
+            raise NotifierError('Google returned an invalid message list.')
+        for item in items:
+            message_id = item.get('id') if isinstance(item, dict) else None
+            if not isinstance(message_id, str) or not message_id or len(message_id) > 128 or not message_id.isalnum():
+                raise NotifierError('Google returned an invalid message identifier.')
+            if message_id not in seen_ids:
+                unread_ids.append(message_id)
+                seen_ids.add(message_id)
         if len(unread_ids) > MAX_UNREAD_IDS:
-            raise NotifierError("This account has too many unread messages to display safely.")
-        page_token = str(page.get("nextPageToken", ""))[:512]
+            raise NotifierError('Unread inbox exceeds the supported limit of 10000 messages.')
+        page_token = page.get('nextPageToken', '')
         if not page_token:
-            break
-    return unread_ids
+            return unread_ids
+        if not isinstance(page_token, str) or len(page_token) > 512 or page_token in seen_pages:
+            raise NotifierError('Google returned invalid pagination.')
+        seen_pages.add(page_token)
+    raise NotifierError('Google pagination exceeded the operation limit.')
 
 
 def fetch_metadata(access_token: str, message_ids: list[str]) -> list[dict]:
@@ -442,9 +562,16 @@ def fetch_metadata(access_token: str, message_ids: list[str]) -> list[dict]:
             ("metadataHeaders", "From"),
             ("metadataHeaders", "Subject"),
         ])
-        message = gmail_request(f"{message_url(message_id)}?{params}", access_token)
+        try:
+            message = gmail_request(f"{message_url(message_id)}?{params}", access_token)
+        except NotifierError as error:
+            if 'HTTP 404' in str(error):
+                continue
+            raise
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
-        raw_headers = payload.get("headers", []) if isinstance(payload, dict) else []
+        raw_headers = payload.get("headers", [])
+        if not isinstance(raw_headers, list) or len(raw_headers) > 100:
+            raise NotifierError('Google returned invalid message headers.')
         headers = {
             str(header.get("name", "")).lower(): str(header.get("value", ""))[:MAX_HEADER_CHARS]
             for header in raw_headers
@@ -465,176 +592,163 @@ def account_cache_path(email: str) -> Path:
 
 def read_details_cache(email: str, unread_ids: list[str]) -> tuple[list[dict], bool]:
     try:
-        cached = json.loads(account_cache_path(email).read_text(encoding="utf-8"))
-        if cached.get("unread_ids") == unread_ids:
-            return cached.get("messages", []), True
-    except (FileNotFoundError, json.JSONDecodeError, AttributeError):
-        pass
-    return [], False
+        cached = read_object(account_cache_path(email)) or {}
+        messages = cached.get('messages', [])
+        if not isinstance(messages, list) or not all(isinstance(m, dict) and isinstance(m.get('id'), str)
+                and isinstance(m.get('from'), str) and isinstance(m.get('subject'), str) for m in messages):
+            return [], False
+        by_id = {m['id']: m for m in messages}
+        current = [by_id[i] for i in unread_ids if i in by_id]
+        return current, len(current) == len(unread_ids)
+    except StorageError:
+        return [], False
 
 
 def write_details_cache(email: str, unread_ids: list[str], messages: list[dict]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(CACHE_DIR, 0o700)
-    path = account_cache_path(email)
-    fd, tmp_name = tempfile.mkstemp(prefix=".details-", dir=CACHE_DIR)
+    value = {'unread_ids': unread_ids, 'messages': messages}
+    if len(json.dumps(value, ensure_ascii=False).encode('utf-8')) > 4 * 1024 * 1024:
+        raise NotifierError('Header cache limit reached; reduce the unread inbox before loading more.')
+    atomic_write(account_cache_path(email), value)
+
+
+def notify_new(account: dict, unread_ids: list[str], access_token: str, language='auto') -> None:
+    previous = set(account.get('last_notification_ids', []))
+    new_ids = [i for i in unread_ids if i not in previous]
+    metadata = []
+    if account.get('notifications', True) and account.get('notification_baseline_set') and new_ids:
+        try:
+            metadata = fetch_metadata(access_token, new_ids[:1])
+        except NotifierError:
+            pass
+    deliver_notification(account, unread_ids, metadata, language)
+
+
+def deliver_notification(account, unread_ids, metadata, language):
+    previous = set(account.get('last_notification_ids', []))
+    baseline = account.get('notification_baseline_set', False)
+    account['last_notification_ids'] = unread_ids
+    account['notification_baseline_set'] = True
+    account.pop('notification_error', None)
+    new_ids = [i for i in unread_ids if i not in previous]
+    if not baseline or not account.get('notifications', True) or not new_ids:
+        return
+    sender, subject = '', ''
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump({"unread_ids": unread_ids, "messages": messages}, stream, ensure_ascii=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, path)
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
+        newest = metadata[0]
+        sender, _ = parseaddr(newest.get('from', ''))
+        sender = sender.strip()[:160]
+        subject = newest.get('subject', '')[:240]
+    except (NotifierError, IndexError):
+        pass
+    spanish = effective_language(language).startswith('es')
+    heading = 'Nuevo email en la cuenta' if spanish else 'New email in account'
+    subject = subject or ('Nuevo correo sin leer' if spanish else 'New unread mail')
+    # Headline is plain text in Omarchy. Body supports only a safe markup subset.
+    label = account.get('initial', '?')[:7]
+    body = (f'<b>{escape(sender, quote=False)}</b>\n' if sender else '') + escape(subject, quote=False)
+    try:
+        desktop.notify(f'{heading} ({label})', body)
+    except Exception:
+        account['notification_error'] = 'Desktop notification delivery failed; Gmail count is still current.'
 
 
-def notify_new(
-    account: dict,
-    unread_ids: list[str],
-    access_token: str,
-    language: str = "en",
-) -> None:
-    if account.get("notifications") is False:
-        account["last_notification_ids"] = unread_ids
-        account["notification_baseline_set"] = True
-        return
-    previous = set(account.get("last_notification_ids", []))
-    if "notification_baseline_set" not in account:
-        account["notification_baseline_set"] = True
-        account["last_notification_ids"] = unread_ids
-        return
-    new_ids = [message_id for message_id in unread_ids if message_id not in previous]
-    if new_ids:
-        sender_name = ""
-        subject = "New unread mail"
-        try:
-            newest = fetch_metadata(access_token, new_ids[:1])[0]
-            sender_name, _sender_address = parseaddr(str(newest.get("from", "")))
-            sender_name = sender_name.strip()[:160]
-            subject = str(newest.get("subject") or subject).strip()[:240]
-        except (NotifierError, IndexError):
-            pass
-        initial = str(account.get("initial", "?")).strip()[:7] or "?"
-        heading = "Nuevo email en la cuenta" if language == "es" else "New email in account"
-        sender_text = escape(sender_name, quote=False) if sender_name else ""
-        notification_headline = f"{heading} ({escape(initial, quote=False)})"
-        subject_text = escape(subject, quote=False)
-        notification_body = (
-            f"<b>{sender_text}</b>\n{subject_text}" if sender_text else subject_text
-        )
-        subprocess.run(
-            [
-                "omarchy-notification-send",
-                "--app-name",
-                "Gmail Notifier",
-                "--icon",
-                "mail-unread",
-                "-u",
-                "normal",
-                "--transient",
-                notification_headline,
-                notification_body,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    account["last_notification_ids"] = unread_ids
+def effective_language(language):
+    if language != 'auto':
+        return language
+    # QML passes the live shell language on the private service channel.
+    return getattr(NETWORK_CONTEXT, 'language', None) or os.environ.get('LANG', 'en').split('.')[0].replace('_', '-')
 
 
 def build_snapshot(force: bool = False) -> dict:
-    APP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with SNAPSHOT_LOCK_PATH.open("a", encoding="utf-8") as lock_stream:
-        fcntl.flock(lock_stream, fcntl.LOCK_EX)
+    with locked(SNAPSHOT_LOCK_PATH), network_budget():
         config = load_config()
         previous = load_runtime_snapshot()
-        now = time.time()
-        checked_at = float((previous or {}).get("checked_at", 0))
-        if not force and previous and now - checked_at < config["poll_interval_minutes"] * 60:
+        checked_at = float((previous or {}).get('checked_at', 0))
+        if not force and previous and time.time() - checked_at < config['poll_interval_minutes'] * 60:
             return snapshot_result(config, previous)
-
-        cached_accounts = {a.get("id"): a for a in (previous or {}).get("accounts", []) if a.get("id")}
-        polled_accounts = []
-        for configured in config["accounts"]:
-            account = copy.deepcopy(configured)
-            prior = cached_accounts.get(account.get("id"), {})
-            for key in ("messages", "unread_count", "details_ready", "last_error"):
-                if key in prior:
-                    account[key] = prior[key]
-            account.setdefault("messages", [])
-            account.setdefault("unread_count", 0)
-            if account.get("enabled") is False:
-                polled_accounts.append(account)
+        polled_accounts = merge_runtime_accounts(config, previous)
+        for account in polled_accounts:
+            if not account['enabled'] or (not force and account.get('retry_at', 0) > time.time()):
                 continue
             try:
-                token = token_lookup(account["email"])
-                access_token, _token = refresh_access_token(account["email"], token)
-                unread_ids = list_unread_ids(access_token)
-                AlertStore(APP_DIR).observe(account["id"], unread_ids,
-                    config.get("flash_until_clicked", False), config.get("flash_duration_seconds", 60))
-                notify_new(account, unread_ids, access_token, config.get("language", "en"))
-                messages, details_ready = read_details_cache(account["email"], unread_ids)
-                account["messages"] = messages
-                account["unread_count"] = len(unread_ids)
-                account["details_ready"] = details_ready or not unread_ids
-                account.pop("last_error", None)
-            except (NotifierError, KeyError, OSError) as error:
-                account["last_error"] = str(error)
-            polled_accounts.append(account)
+                request_timeout()
+                token = token_lookup(account['email'], account['generation'])
+                access, _ = refresh_access_token(account['email'], token, account['generation'])
+                ids = list_unread_ids(access)
+                # Fetch optional notification metadata outside the config lock.
+                new_ids = [i for i in ids if i not in account.get('last_notification_ids', [])]
+                newest = None
+                if account.get('notifications') and account.get('notification_baseline_set') and new_ids:
+                    try:
+                        newest = fetch_metadata(access, new_ids[:1])
+                    except NotifierError:
+                        newest = []
+                with config_transaction() as latest:
+                    current = find_account(latest, account['id'])
+                    if not current or not current['enabled'] or current.get('generation') != account.get('generation'):
+                        continue
+                    account.update({k: current[k] for k in ('initial', 'notifications')})
+                    AlertStore(APP_DIR).observe(account['id'], ids, latest['flash_until_clicked'], latest['flash_duration_seconds'])
+                    account['unread_ids'] = ids
+                    messages, ready = read_details_cache(account['email'], ids)
+                    account.update(messages=messages, unread_count=len(ids), details_ready=ready or not ids,
+                                   details_loaded=len(messages), details_more=len(messages) < len(ids), failures=0, retry_at=0)
+                    account.pop('last_error', None)
+                    account.pop('details_error', None)
+                    # Metadata was fetched before the short config transaction.
+                    deliver_notification(account, ids, newest or [], latest['language'])
+                    current['last_notification_ids'] = ids
+                    current['notification_baseline_set'] = True
+            except (NotifierError, OSError) as error:
+                failures = min(6, int(account.get('failures', 0)) + 1)
+                account.update(last_error=str(error), failures=failures,
+                               retry_at=time.time() + max(getattr(error, 'retry_after', 0), min(900, 30 * 2 ** (failures - 1))))
+        latest = load_config()
+        merged = merge_runtime_accounts(latest, {'accounts': polled_accounts})
+        save_runtime_snapshot(merged, time.time())
+        return snapshot_result(latest, load_runtime_snapshot())
 
-        # Preserve settings changed while the Gmail requests were in flight.
-        latest_config = load_config()
-        polled_by_id = {a.get("id"): a for a in polled_accounts}
-        for account in latest_config["accounts"]:
-            polled = polled_by_id.get(account.get("id"))
-            if not polled:
-                continue
-            for key in ("last_notification_ids", "notification_baseline_set"):
-                if key in polled:
-                    account[key] = polled[key]
-        save_config(latest_config)
-        save_runtime_snapshot(merge_runtime_accounts(latest_config, {"accounts": polled_accounts}), time.time())
-        return snapshot_result(latest_config, load_runtime_snapshot())
 
-
-def account_details(account_id: str) -> int:
-    APP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with SNAPSHOT_LOCK_PATH.open("a", encoding="utf-8") as lock_stream:
-        fcntl.flock(lock_stream, fcntl.LOCK_EX)
+def account_details(account_id: str, more=False) -> int:
+    with network_budget():
         config = load_config()
         account = find_account(config, account_id)
-        if account is None:
-            emit({"ok": False, "error": "Account not found"})
-            return 1
-        if account.get("enabled") is False:
-            emit({"ok": False, "error": "This account is paused"})
-            return 1
+        if account is None or not account['enabled']:
+            raise NotifierError('Account is missing or paused.')
+        generation = account['generation']
+        previous = load_runtime_snapshot() or {'accounts': [], 'checked_at': 0}
+        runtime = merge_runtime_accounts(config, previous)
+        current = next(a for a in runtime if a['id'] == account_id)
         try:
-            token = token_lookup(account["email"])
-            access_token, _token = refresh_access_token(account["email"], token)
-            unread_ids = list_unread_ids(access_token)
-            messages = fetch_metadata(access_token, unread_ids)
-            write_details_cache(account["email"], unread_ids, messages)
-            account["messages"] = messages
-            account["unread_count"] = len(unread_ids)
-            account["details_ready"] = True
-            account.pop("last_error", None)
-            previous = load_runtime_snapshot() or {}
-            runtime_accounts = merge_runtime_accounts(config, previous)
-            for index, current in enumerate(runtime_accounts):
-                if current.get("id") == account_id:
-                    runtime_accounts[index] = copy.deepcopy(account)
-                    break
-            save_runtime_snapshot(runtime_accounts, float(previous.get("checked_at", 0)))
-            emit(snapshot_result(config, load_runtime_snapshot()))
+            token = token_lookup(account['email'], account['generation'])
+            access, _ = refresh_access_token(account['email'], token, account['generation'])
+            ids = current.get('unread_ids')
+            if not isinstance(ids, list):
+                ids = list_unread_ids(access)
+            cached, _ = read_details_cache(account['email'], ids)
+            cached_ids = {m['id'] for m in cached}
+            pending = [i for i in ids if i not in cached_ids][:MAX_DETAIL_MESSAGES] if more or not cached else []
+            messages = cached + fetch_metadata(access, pending)
+            by_id = {m['id']: m for m in messages}
+            messages = [by_id[i] for i in ids if i in by_id]
+            with config_transaction() as latest:
+                configured = find_account(latest, account_id)
+                if not configured or not configured['enabled'] or configured['generation'] != generation:
+                    raise NotifierError('Account changed while details were loading.')
+                write_details_cache(account['email'], ids, messages)
+                # Reread the latest shared snapshot before replacing only this account.
+                recent = load_runtime_snapshot() or previous
+                runtime = merge_runtime_accounts(latest, recent)
+                for item in runtime:
+                    if item['id'] == account_id:
+                        item.update(messages=messages, unread_ids=ids, unread_count=len(ids), details_ready=True,
+                                    details_loaded=len(messages), details_more=len(cached) + len(pending) < len(ids))
+                        item.pop('details_error', None)
+                save_runtime_snapshot(runtime, recent['checked_at'])
+            emit(snapshot_result(latest, load_runtime_snapshot()))
             return 0
-        except (NotifierError, KeyError, OSError) as error:
-            emit({"ok": False, "error": f"{account.get('email', 'Account')}: {error}"})
-            return 1
+        except NotifierError as error:
+            raise NotifierError(str(error)) from error
 
 
 def find_account(config: dict, account_id: str) -> dict | None:
@@ -642,43 +756,40 @@ def find_account(config: dict, account_id: str) -> dict | None:
 
 
 def set_enabled(account_id: str, value: str) -> int:
-    config = load_config()
-    account = find_account(config, account_id)
-    if account is None:
-        emit({"ok": False, "error": "Account not found"})
-        return 1
-    account["enabled"] = value.lower() in {"true", "1", "yes"}
-    save_config(config)
-    emit(build_snapshot(force=account["enabled"]))
-    return 0
+    with config_transaction() as config:
+        account = find_account(config, account_id)
+        if account is None:
+            emit({"ok": False, "error": "Account not found"})
+            return 1
+        account["enabled"] = value.lower() in {"true", "1", "yes"}
+        emit(snapshot_result(config, load_runtime_snapshot()))
+        return 0
 
 
 def set_initial(account_id: str, value: str) -> int:
-    config = load_config()
-    account = find_account(config, account_id)
-    initial = value.strip()
-    if account is None:
-        emit({"ok": False, "error": "Account not found"})
-        return 1
-    if not initial or len(initial) > 7:
-        emit({"ok": False, "error": "Choose a letter or symbol (up to seven characters)"})
-        return 1
-    account["initial"] = initial.upper()
-    save_config(config)
-    emit(build_snapshot())
-    return 0
+    with config_transaction() as config:
+        account = find_account(config, account_id)
+        initial = value.strip()
+        if account is None:
+            emit({"ok": False, "error": "Account not found"})
+            return 1
+        if not initial or len(initial.upper()) > 7 or any(ord(c) < 32 for c in initial):
+            emit({"ok": False, "error": "Choose a letter or symbol (up to seven characters)"})
+            return 1
+        account["initial"] = initial.upper()
+        emit(snapshot_result(config, load_runtime_snapshot()))
+        return 0
 
 
 def set_notifications(account_id: str, value: str) -> int:
-    config = load_config()
-    account = find_account(config, account_id)
-    if account is None:
-        emit({"ok": False, "error": "Account not found"})
-        return 1
-    account["notifications"] = value.lower() in {"true", "1", "yes"}
-    save_config(config)
-    emit(build_snapshot())
-    return 0
+    with config_transaction() as config:
+        account = find_account(config, account_id)
+        if account is None:
+            emit({"ok": False, "error": "Account not found"})
+            return 1
+        account["notifications"] = value.lower() in {"true", "1", "yes"}
+        emit(snapshot_result(config, load_runtime_snapshot()))
+        return 0
 
 
 def set_interval(value: str) -> int:
@@ -687,85 +798,87 @@ def set_interval(value: str) -> int:
     except ValueError:
         emit({"ok": False, "error": "Check interval must be between 1 and 60 minutes"})
         return 1
-    config = load_config()
-    config["poll_interval_minutes"] = interval
-    save_config(config)
-    emit(build_snapshot())
-    return 0
+    with config_transaction() as config:
+        config["poll_interval_minutes"] = interval
+        emit(snapshot_result(config, load_runtime_snapshot()))
+        return 0
 
 
 def set_display_setting(name: str, value: str) -> int:
-    config = load_config()
-    if name == "language":
-        language = value.lower()
-        if language not in {"es", "en"}:
-            emit({"ok": False, "error": "Language must be es or en"})
+    with config_transaction() as config:
+        if name == "language":
+            language = value.lower()
+            if language not in {"auto", "es", "en"}:
+                emit({"ok": False, "error": "Language must be auto, es or en"})
+                return 1
+            config["language"] = language
+            emit(snapshot_result(config, load_runtime_snapshot()))
+            return 0
+        if name == "flash-until-clicked":
+            config["flash_until_clicked"] = value.lower() in {"true", "1", "yes"}
+            emit(snapshot_result(config, load_runtime_snapshot()))
+            return 0
+        try:
+            number = int(value)
+        except ValueError:
+            emit({"ok": False, "error": "Display setting must be a whole number"})
             return 1
-        config["language"] = language
-        save_config(config)
-        emit(build_snapshot())
+        if name == "font-size-offset":
+            config["font_size_offset"] = max(-2, min(8, number))
+        elif name == "panel-width":
+            config["panel_width"] = max(360, min(720, number))
+        elif name == "flash-duration-seconds":
+            config["flash_duration_seconds"] = max(5, min(600, number))
+        else:
+            emit({"ok": False, "error": "Unknown display setting"})
+            return 1
+        emit(snapshot_result(config, load_runtime_snapshot()))
         return 0
-    if name == "flash-until-clicked":
-        config["flash_until_clicked"] = value.lower() in {"true", "1", "yes"}
-        save_config(config)
-        emit(build_snapshot())
-        return 0
-    try:
-        number = int(value)
-    except ValueError:
-        emit({"ok": False, "error": "Display setting must be a whole number"})
-        return 1
-    if name == "font-size-offset":
-        config["font_size_offset"] = max(-2, min(8, number))
-    elif name == "panel-width":
-        config["panel_width"] = max(360, min(720, number))
-    elif name == "flash-duration-seconds":
-        config["flash_duration_seconds"] = max(5, min(600, number))
-    else:
-        emit({"ok": False, "error": "Unknown display setting"})
-        return 1
-    save_config(config)
-    emit(build_snapshot())
-    return 0
 
 
 def reorder_account(account_id: str, direction: str) -> int:
-    config = load_config()
-    index = next((i for i, item in enumerate(config["accounts"]) if item.get("id") == account_id), -1)
-    if index < 0:
-        emit({"ok": False, "error": "Account not found"})
-        return 1
-    target = index - 1 if direction == "up" else index + 1 if direction == "down" else index
-    if direction not in {"up", "down"}:
-        emit({"ok": False, "error": "Direction must be up or down"})
-        return 1
-    if 0 <= target < len(config["accounts"]):
-        config["accounts"][index], config["accounts"][target] = config["accounts"][target], config["accounts"][index]
-    save_config(config)
-    emit(build_snapshot())
-    return 0
+    with config_transaction() as config:
+        index = next((i for i, item in enumerate(config["accounts"]) if item.get("id") == account_id), -1)
+        if index < 0:
+            emit({"ok": False, "error": "Account not found"})
+            return 1
+        target = index - 1 if direction == "up" else index + 1 if direction == "down" else index
+        if direction not in {"up", "down"}:
+            emit({"ok": False, "error": "Direction must be up or down"})
+            return 1
+        if 0 <= target < len(config["accounts"]):
+            config["accounts"][index], config["accounts"][target] = config["accounts"][target], config["accounts"][index]
+        emit(snapshot_result(config, load_runtime_snapshot()))
+        return 0
 
 
 def remove_account(account_id: str) -> int:
-    config = load_config()
-    account = find_account(config, account_id)
-    if account is None:
-        emit({"ok": False, "error": "Account not found"})
-        return 1
-    AlertStore(APP_DIR).remove(account_id)
-    token_clear(account["email"])
-    try:
-        account_cache_path(account["email"]).unlink()
-    except FileNotFoundError:
-        pass
-    config["accounts"] = [a for a in config["accounts"] if a.get("id") != account_id]
-    save_config(config)
-    emit(build_snapshot())
-    return 0
+    with config_transaction() as config:
+        account = find_account(config, account_id)
+        if account is None:
+            emit({"ok": False, "error": "Account not found"})
+            return 1
+        AlertStore(APP_DIR).remove(account_id)
+        token_clear(account["email"])
+        try:
+            account_cache_path(account["email"]).unlink()
+        except FileNotFoundError:
+            pass
+        config["accounts"] = [a for a in config["accounts"] if a.get("id") != account_id]
+        emit(snapshot_result(config, load_runtime_snapshot()))
+        return 0
 
 
 def main(argv: list[str]) -> int:
     try:
+        if argv == ["serve"]:
+            from service import Service
+            Service(sys.modules[__name__]).run()
+            return 0
+        if argv == ["watch"]:
+            from service import watch
+            watch(sys.modules[__name__])
+            return 0
         if not argv or argv[0] == "snapshot":
             emit(build_snapshot())
             return 0
@@ -792,21 +905,22 @@ def main(argv: list[str]) -> int:
             return set_display_setting(args[0], args[1])
         if command == "move-account" and len(args) == 2:
             return reorder_account(args[0], args[1])
-        if command == "details" and len(args) == 1:
-            return account_details(args[0])
+        if command in ("details", "more-details") and len(args) == 1:
+            return account_details(args[0], command == "more-details")
         if command == "remove-account" and len(args) == 1:
             return remove_account(args[0])
         if command == "add-account" and not args:
             authorize_account()
-            emit(build_snapshot(force=True))
+            emit(snapshot_result(load_config(), load_runtime_snapshot()))
             return 0
         emit({"ok": False, "error": "Unknown command"})
         return 2
-    except NotifierError as error:
-        emit({"ok": False, "error": str(error)})
+    except (NotifierError, StorageError, OSError, ValueError, TypeError, KeyError) as error:
+        emit({"ok": False, "error": str(error) if isinstance(error, (NotifierError, StorageError)) else "Operation failed; check configuration and desktop services."})
         return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
 

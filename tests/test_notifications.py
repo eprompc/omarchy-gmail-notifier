@@ -1,66 +1,52 @@
 import importlib.util
-import pathlib
+from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
 
-
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "helper"))
-spec = importlib.util.spec_from_file_location("gmail_helper", ROOT / "helper" / "main.py")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'helper'))
+spec = importlib.util.spec_from_file_location('notifier_notifications', Path(__file__).resolve().parents[1] / 'helper/main.py')
 helper = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
 spec.loader.exec_module(helper)
 
 
 class NotificationPrivacyTests(unittest.TestCase):
-    def test_notification_shows_sender_and_subject_without_mailbox(self):
-        account = {
-            "email": "private-account@example.com",
-            "initial": "TR",
-            "last_notification_ids": [],
-            "notification_baseline_set": True,
-        }
-        calls = []
+    def account(self):
+        return dict(email='private@example.invalid', initial='TR', last_notification_ids=[], notification_baseline_set=True)
 
-        def fake_run(command, **_kwargs):
-            calls.append(command)
+    def test_private_text_is_delivered_in_process(self):
+        account = self.account()
+        with patch.object(helper, 'fetch_metadata', return_value=[
+                {'from': 'Alice <alice@example.invalid>', 'subject': 'Private subject'}]), \
+                patch.object(helper.desktop, 'notify', return_value=42) as notify, \
+                patch('subprocess.run', side_effect=AssertionError('No child process')):
+            helper.notify_new(account, ['m1'], 'fake', 'es')
+        notify.assert_called_once_with('Nuevo email en la cuenta (TR)', '<b>Alice</b>\nPrivate subject')
+        self.assertNotIn('private@example.invalid', str(notify.call_args))
+        self.assertNotIn('alice@example.invalid', str(notify.call_args))
 
-        with patch.object(helper, "fetch_metadata", return_value=[{
-            "from": "Alice Example <alice@example.com>",
-            "subject": "Confidential project details",
-        }]), patch.object(helper.subprocess, "run", side_effect=fake_run):
-            helper.notify_new(account, ["message-1"], "token", "es")
+    def test_sender_and_subject_markup_are_escaped(self):
+        with patch.object(helper, 'fetch_metadata', return_value=[
+                {'from': '"<img>" <alice@example.invalid>', 'subject': '<a href="https://example.invalid">secret</a>'}]), \
+                patch.object(helper.desktop, 'notify') as notify:
+            helper.notify_new(self.account(), ['m1'], 'fake')
+        body = notify.call_args.args[1]
+        self.assertNotIn('<img>', body)
+        self.assertNotIn('<a ', body)
+        self.assertIn('&lt;img&gt;', body)
 
-        self.assertEqual(calls[0][0], "omarchy-notification-send")
-        self.assertIn("--transient", calls[0])
-        self.assertEqual(calls[0][-2:], [
-            "Nuevo email en la cuenta (TR)",
-            "<b>Alice Example</b>\nConfidential project details",
-        ])
-        self.assertNotIn("private-account@example.com", calls[0])
-        self.assertNotIn("alice@example.com", calls[0])
-        self.assertNotIn("notify-send", calls[0])
+    def test_disabled_alerts_do_not_read_headers_or_notify(self):
+        account = self.account(); account['notifications'] = False
+        with patch.object(helper, 'fetch_metadata') as metadata, patch.object(helper.desktop, 'notify') as notify:
+            helper.notify_new(account, ['m1'], 'fake')
+        metadata.assert_not_called(); notify.assert_not_called()
 
-    def test_sender_markup_is_escaped(self):
-        account = {
-            "email": "private-account@example.com",
-            "initial": "TR",
-            "last_notification_ids": [],
-            "notification_baseline_set": True,
-        }
-        calls = []
-
-        with patch.object(helper, "fetch_metadata", return_value=[{
-            "from": '"<img src=\'https://example.invalid/tracker\'>" <sender@example.com>',
-            "subject": "Secret",
-        }]), patch.object(helper.subprocess, "run", side_effect=lambda command, **_kwargs: calls.append(command)):
-            helper.notify_new(account, ["message-1"], "token", "es")
-
-        body = calls[0][-1]
-        self.assertNotIn("<img", body)
-        self.assertIn("&lt;img", body)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_delivery_failure_does_not_discard_new_count_or_repeat_event(self):
+        account = self.account()
+        with patch.object(helper.desktop, 'notify', side_effect=RuntimeError('no bus')):
+            helper.deliver_notification(account, ['m1'], [], 'en')
+        self.assertIn('notification_error', account)
+        self.assertEqual(account['last_notification_ids'], ['m1'])
+        with patch.object(helper.desktop, 'notify') as notify:
+            helper.deliver_notification(account, ['m1'], [], 'en')
+        notify.assert_not_called()

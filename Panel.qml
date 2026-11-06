@@ -21,7 +21,7 @@ Panel {
   property bool oauthReady: false
   property int fontSizeOffset: 0
   property int panelWidth: 376
-  property string language: "en"
+  property string language: "auto"
   property string pendingRemoveId: ""
   property int flashDurationSeconds: 60
   property bool flashUntilClicked: false
@@ -34,7 +34,11 @@ Panel {
     id: themeColorsView
     path: Color.currentThemePath + "/colors.toml"
     printErrors: false
+    watchChanges: true
+    onFileChanged: reload()
     onLoaded: {
+      root.themeGreen = Color.accent
+      root.themeRed = Color.urgent
       var lines = text().split("\n")
       for (var i = 0; i < lines.length; i++) {
         var matchG = lines[i].match(/^\s*green\s*=\s*["']?(#[0-9A-Fa-f]{6})/)
@@ -66,7 +70,12 @@ Panel {
     return false
   }
   function account(id) { return Model.accountById(accounts, id) }
-  function tr(es, en) { return language === "en" ? en : es }
+  Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
+  function tr(es, en) {
+    if (language === "en") return en
+    if (language === "es") return es
+    return strings.t(en, en)
+  }
   function runAction(args) {
     if (!hostWidget || typeof hostWidget.runAction !== "function") return
     hostWidget.runAction(args)
@@ -204,6 +213,12 @@ Panel {
         font.pixelSize: Style.font.bodySmall
       }
 
+      Ui.Button {
+        visible: root.isActionRunning && root.hostWidget && root.hostWidget.currentAction[0] === "add-account"
+        text: root.tr("Cancelar autorización", "Cancel authorization")
+        onClicked: root.hostWidget.cancelAuthorization()
+      }
+
       Repeater {
         model: root.accounts
         delegate: Column {
@@ -277,7 +292,9 @@ Panel {
                 horizontalAlignment: TextInput.AlignHCenter
                 verticalAlignment: TextInput.AlignVCenter
                 selectByMouse: true
-                onEditingFinished: root.runAction(["set-initial", modelData.id, text])
+                onEditingFinished: {
+                  if (text !== String(modelData.initial || "?")) root.runAction(["set-initial", modelData.id, text])
+                }
               }
             }
           }
@@ -393,6 +410,11 @@ Panel {
         spacing: Style.space(6)
         Text { text: root.tr("Idioma", "Language"); color: root.foreground; font.pixelSize: Style.font.bodySmall; anchors.verticalCenter: parent.verticalCenter }
         Ui.Button {
+          text: root.tr("Sistema", "System"); bordered: true
+          enabled: root.language !== "auto"
+          onClicked: root.runAction(["set-display", "language", "auto"])
+        }
+        Ui.Button {
           text: "English"; bordered: true; horizontalPadding: Style.space(7); verticalPadding: Style.space(2)
           enabled: root.language !== "en"
           onClicked: root.runAction(["set-display", "language", "en"])
@@ -420,7 +442,7 @@ Panel {
           onClicked: root.cycleInterval(-1)
         }
         Text {
-          text: String(root.hostWidget ? root.hostWidget.pollIntervalMinutes : 2) + " min"
+          text: Commons.I18n.formatNumber(root.hostWidget ? root.hostWidget.pollIntervalMinutes : 2) + " min"
           color: root.foreground
           font.pixelSize: Style.font.bodySmall
           anchors.verticalCenter: parent.verticalCenter
@@ -480,7 +502,7 @@ Panel {
           }
         }
         Text {
-          text: String(root.flashDurationSeconds) + " s"
+          text: Commons.I18n.formatNumber(root.flashDurationSeconds) + " s"
           color: root.foreground
           font.pixelSize: Style.font.bodySmall
           anchors.verticalCenter: parent.verticalCenter
@@ -511,7 +533,7 @@ Panel {
           fontSize: Style.font.bodySmall; horizontalPadding: 0; verticalPadding: 0
           onClicked: root.runAction(["set-display", "font-size-offset", String(root.fontSizeOffset - 1)])
         }
-        Text { text: String(root.configuredFontSize) + " px"; color: root.foreground; font.pixelSize: Style.font.bodySmall; anchors.verticalCenter: parent.verticalCenter }
+        Text { text: Commons.I18n.formatNumber(root.configuredFontSize) + " px"; color: root.foreground; font.pixelSize: Style.font.bodySmall; anchors.verticalCenter: parent.verticalCenter }
         Ui.Button {
           text: "+"; bordered: true; width: Style.space(24); height: Style.space(24); anchors.verticalCenter: parent.verticalCenter
           fontSize: Style.font.bodySmall; horizontalPadding: 0; verticalPadding: 0
@@ -528,7 +550,7 @@ Panel {
           fontSize: Style.font.bodySmall; horizontalPadding: 0; verticalPadding: 0
           onClicked: root.runAction(["set-display", "panel-width", String(root.panelWidth - 24)])
         }
-        Text { text: String(root.panelWidth) + " px"; color: root.foreground; font.pixelSize: Style.font.bodySmall; anchors.verticalCenter: parent.verticalCenter }
+        Text { text: Commons.I18n.formatNumber(root.panelWidth) + " px"; color: root.foreground; font.pixelSize: Style.font.bodySmall; anchors.verticalCenter: parent.verticalCenter }
         Ui.Button {
           text: "+"; bordered: true; width: Style.space(24); height: Style.space(24); anchors.verticalCenter: parent.verticalCenter
           fontSize: Style.font.bodySmall; horizontalPadding: 0; verticalPadding: 0
@@ -615,10 +637,20 @@ Panel {
         visible: parent.selected && parent.selected.messages.length === 0
         width: parent.width
         text: parent.selected && parent.selected.unread_count > 0 && parent.selected.details_ready !== true
-          ? root.tr("Cargando remitente y asunto…", "Loading sender and subject…")
+          ? root.isActionRunning ? root.tr("Cargando remitente y asunto…", "Loading sender and subject…") : root.tr("Pulsa Cargar mensajes para reintentar", "Choose Load messages to retry")
           : root.tr("No hay mensajes sin leer en Recibidos", "No unread messages in Inbox")
         color: root.panelText
         font.pixelSize: root.configuredFontSize
+      }
+
+      Row {
+        spacing: Style.space(8)
+        visible: parent.selected && (parent.selected.details_ready !== true || parent.selected.details_more === true)
+        Ui.Button {
+          text: root.tr("Cargar mensajes", "Load messages")
+          enabled: !root.isActionRunning
+          onClicked: root.runAction(["more-details", root.selectedAccountId])
+        }
       }
 
       Repeater {
@@ -658,3 +690,4 @@ Panel {
   }
 
 }
+
