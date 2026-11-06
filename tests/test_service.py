@@ -99,3 +99,17 @@ class ServiceTests(unittest.TestCase):
                 for p in processes:
                     p.stdin.close();p.wait(timeout=3);p.stdout.close();p.stderr.close()
                 self.service.stop.set();thread.join(3)
+
+    def test_code_update_uses_new_backend_without_moving_personal_state(self):
+        from types import SimpleNamespace
+        from service import socket_path
+        source=self.directory/'source';source.mkdir()
+        script=source/'main.py';script.write_text('# old backend')
+        helper=SimpleNamespace(APP_DIR=self.directory,__file__=str(script))
+        first=socket_path(helper)
+        script.write_text('# updated backend')
+        second=socket_path(helper)
+        self.assertNotEqual(first,second)
+        self.assertEqual(first.parent,second.parent)
+        self.assertNotEqual(first.with_suffix('.lock'),second.with_suffix('.lock'))
+        self.assertEqual(helper.APP_DIR,self.directory)

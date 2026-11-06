@@ -5,6 +5,7 @@ for Gmail. State is reread after each operation and published in a single ordere
 stream with an epoch/revision, rather than applying competing process outputs.
 """
 import fcntl
+import hashlib
 import json
 import os
 import queue
@@ -28,7 +29,14 @@ def socket_path(helper):
     runtime = os.environ.get('XDG_RUNTIME_DIR')
     base = Path(runtime) / 'omarchy-gmail-notifier' if runtime else helper.APP_DIR / 'runtime'
     private_directory(base)
-    return base / 'service-v030.sock'
+    # A source update must start the matching backend immediately, even if the
+    # old daemon is still inside its idle grace period. Personal state stays put.
+    source = Path(helper.__file__).resolve().parent
+    digest = hashlib.sha256()
+    for file in sorted(source.glob('*.py')):
+        digest.update(file.name.encode('utf-8'))
+        digest.update(file.read_bytes())
+    return base / ('service-' + digest.hexdigest()[:16] + '.sock')
 
 
 class Service:
@@ -169,7 +177,7 @@ class Service:
 
     def run(self):
         path = socket_path(self.h)
-        with (path.parent / 'service.lock').open('a') as lock:
+        with path.with_suffix('.lock').open('a') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -208,6 +216,8 @@ class Service:
                                 self.jobs.put_nowait((['snapshot'], None, None))
                         except Exception:
                             self.publish()
+                    if not active:
+                        self.h.AUTH_CANCELLED.set()
                     if not active and self.jobs.unfinished_tasks == 0 and time.monotonic() - self.last_activity > 60:
                         break
             finally:

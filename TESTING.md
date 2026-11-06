@@ -32,7 +32,7 @@ omarchy plugin validate .
 omarchy plugin enable eprom.gmail-notifier
 ```
 
-Use the existing OAuth client and accounts. Installing the new dependencies does not require new Google scopes. The first successful use migrates existing secret entries to hashed keys inside Secret Service. The previous version can therefore require reauthorizing accounts after rollback; do not delete tokens or personal state as part of testing. Configuration IDs are retained for existing accounts.
+Use the existing OAuth client and accounts. Installing the new dependencies does not require new Google scopes. The first successful use creates a compatible hashed credential copy inside Secret Service while retaining the original entry. Refresh keeps both formats synchronized, and rollback to the previous release must reuse the existing authorization. Do not delete tokens or personal state as part of testing. Configuration IDs are retained for existing accounts.
 
 The normal Omarchy plugin updater fetches the default branch (`main`), not this candidate. Do not run it while trying the candidate.
 
@@ -41,7 +41,7 @@ The normal Omarchy plugin updater fetches the default branch (`main`), not this 
 Record the exact commit, Omarchy version, monitor count and scale factors. The repository owner reported successful routine testing of the previous version; this candidate changes IPC and needs its own acceptance record.
 
 - [ ] Validate and load in Omarchy 4.5 without QML import/runtime errors.
-- [ ] Authorize a new account and read an existing legacy authorization; cancel one authorization attempt.
+- [ ] Update an existing installation without authorizing again. Verify unchanged accounts, order, initials, switches, language and layout; roll back and verify authorization still works. Separately authorize a new test account and cancel one authorization attempt.
 - [ ] Receive a synthetic email. Verify account initials in the title, sender in bold, subject below, theme appearance, DND and alert disabling.
 - [ ] With synthetic notification data, inspect process command lines during delivery: no sender, subject, account address, or token should appear in newly launched desktop helper commands.
 - [ ] On two/three monitors, receive new mail, acknowledge on each monitor, test a new arrival concurrent with a click, disconnect/reconnect a monitor, and restart the shell.

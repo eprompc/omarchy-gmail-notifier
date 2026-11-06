@@ -2,7 +2,7 @@
 
 ## 0.3.0 — candidate
 
-- Deliver notifications through Gio D-Bus inside the helper process; access and migrate secrets using libsecret in process.
+- Deliver notifications through Gio D-Bus inside the helper process; access credentials with libsecret in process; preserve and synchronize legacy entries for updates and rollback.
 - Preserve account initials, sender and subject in transient desktop notifications without placing them in child-process arguments.
 - Share an owner-only local service across monitors, with persistent clients, ordered revisions and an action queue.
 - Protect configuration edits with short transactions and a private backup; reject invalid state without silently deleting configuration.

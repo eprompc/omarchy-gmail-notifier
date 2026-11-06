@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "poll_interval_minutes": 7,
+  "flash_duration_seconds": 125,
+  "flash_until_clicked": true,
+  "font_size_offset": 3,
+  "panel_width": 448,
+  "language": "es",
+  "custom_future_setting": {"keep": "unchanged"},
+  "accounts": [
+    {"id": "work@example.invalid", "email": "work@example.invalid", "initial": "TR", "enabled": true, "notifications": false, "last_notification_ids": ["abc123"], "notification_baseline_set": true},
+    {"id": "home@example.invalid", "email": "home@example.invalid", "initial": "CASA", "enabled": false, "notifications": true, "last_notification_ids": [], "notification_baseline_set": true}
+  ]
+}

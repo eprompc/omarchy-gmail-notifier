@@ -43,11 +43,21 @@ with tempfile.TemporaryDirectory() as temporary:
         attrs={'application':'gmail-notifier','account':address}
         assert Secret.password_store_sync(schema,attrs,Secret.COLLECTION_DEFAULT,'synthetic legacy',json.dumps(token),None)
         assert desktop.lookup(address)==token
-        assert Secret.password_lookup_sync(schema,attrs,None) is None
+        # A release using secret-tool must still find its unchanged credential.
+        assert json.loads(Secret.password_lookup_sync(schema,attrs,None))==token
         assert desktop.lookup(address)==token
+        renewed=dict(token,access_token='renewed-synthetic-access',refresh_token='renewed-synthetic-refresh')
+        desktop.store(address,renewed)
+        assert json.loads(Secret.password_lookup_sync(schema,attrs,None))==renewed
+        assert desktop.lookup(address)==renewed
+        # The previous candidate could leave only the hashed entry. Repair that
+        # layout without any Google authorization or token deletion.
+        Secret.password_clear_sync(schema,attrs,None)
+        assert desktop.lookup(address)==renewed
+        assert json.loads(Secret.password_lookup_sync(schema,attrs,None))==renewed
         desktop.clear(address)
         assert desktop.lookup(address) is None
-        print('Real libsecret store/lookup/clear and legacy migration passed on an isolated empty keyring.')
+        print('Real libsecret upgrade, refresh, rollback-compatible lookup and clear passed on an isolated empty keyring.')
     finally:
         process.terminate()
         try: process.wait(timeout=3)

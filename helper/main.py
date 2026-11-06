@@ -72,7 +72,7 @@ def load_config() -> dict:
     if data is None:
         data = copy.deepcopy(DEFAULT_CONFIG)
         data['language'] = 'auto'
-    if not isinstance(data.get('accounts', []), list) or len(data.get('accounts', [])) > MAX_ACCOUNTS:
+    if not isinstance(data.get('accounts', []), list):
         raise StorageError('Invalid account list; restore config.json from a valid backup.')
     defaults = {'poll_interval_minutes': (2, 1, 60), 'flash_duration_seconds': (60, 5, 600),
                 'font_size_offset': (0, -2, 8), 'panel_width': (376, 360, 720)}
@@ -108,7 +108,7 @@ def load_config() -> dict:
         if not isinstance(account['generation'], str) or len(account['generation']) > 64:
             raise StorageError('Invalid account generation in config.json.')
         account.setdefault('initial', '?')
-        if not isinstance(account['initial'], str) or len(account['initial']) > 7 or any(ord(c) < 32 for c in account['initial']):
+        if not isinstance(account['initial'], str) or len(account['initial']) > 64 or any(ord(c) < 32 for c in account['initial']):
             raise StorageError('Invalid account label in config.json.')
         for name in ('enabled', 'notifications'):
             account.setdefault(name, True)
@@ -229,7 +229,8 @@ def merge_runtime_accounts(config: dict, snapshot: dict | None) -> list[dict]:
 def snapshot_result(config: dict, snapshot: dict | None) -> dict:
     accounts = merge_runtime_accounts(config, snapshot)
     for account in accounts:
-        account.pop("unread_ids", None)
+        for key in ("unread_ids", "last_notification_ids", "notification_baseline_set", "generation"):
+            account.pop(key, None)
     errors = [f"{a.get('initial', 'Account')}: {a.get('last_error') or a.get('notification_error') or a.get('details_error')}"
               for a in accounts if a.get("last_error") or a.get("notification_error") or a.get("details_error")]
     return {
@@ -311,7 +312,7 @@ def token_lookup(email: str, generation=None) -> dict:
             account = next((a for a in config['accounts'] if a['email'] == email and a['enabled']), None)
             if account is None or (generation is not None and account.get('generation') != generation):
                 raise NotifierError('Account was removed, paused or replaced.')
-            token = desktop.lookup(email)
+            token = desktop.lookup(email, preserve_legacy=True)
         if not isinstance(token, dict) or not isinstance(token.get('refresh_token'), str) or not token['refresh_token']:
             raise NotifierError('No valid saved Google authorization; reconnect this account.')
         if not isinstance(token.get('expires_at', 0), (int, float)) or not 0 <= token.get('expires_at', 0) < 1e12:
@@ -327,7 +328,7 @@ def token_lookup(email: str, generation=None) -> dict:
 
 def token_store(email: str, token: dict) -> None:
     try:
-        desktop.store(email, token)
+        desktop.store(email, token, preserve_legacy=True)
     except Exception as error:
         raise NotifierError('Secret Service could not store authorization.') from error
 
@@ -374,6 +375,10 @@ def refresh_access_token(email: str, token: dict, generation=None) -> tuple[str,
     refreshed = token_request(form)
     if not isinstance(refreshed.get('access_token'), str) or not refreshed['access_token']:
         raise NotifierError('Google did not return a valid access token.')
+    if 'refresh_token' in refreshed:
+        if not isinstance(refreshed['refresh_token'], str) or not refreshed['refresh_token']:
+            raise NotifierError('Google returned an invalid refresh token; saved authorization was retained.')
+        token['refresh_token'] = refreshed['refresh_token']
     token["access_token"] = refreshed["access_token"]
     token["expires_at"] = time.time() + max(60, min(86400, int(refreshed.get("expires_in", 3600))))
     with config_transaction() as config:
