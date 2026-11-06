@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import base64
 import copy
+from email.utils import parseaddr
 import fcntl
 import hashlib
 import http.server
 import json
+from html import escape
 import os
 import secrets
 import subprocess
@@ -490,7 +492,12 @@ def write_details_cache(email: str, unread_ids: list[str], messages: list[dict])
             pass
 
 
-def notify_new(account: dict, unread_ids: list[str], access_token: str) -> None:
+def notify_new(
+    account: dict,
+    unread_ids: list[str],
+    access_token: str,
+    language: str = "en",
+) -> None:
     if account.get("notifications") is False:
         account["last_notification_ids"] = unread_ids
         account["notification_baseline_set"] = True
@@ -502,19 +509,35 @@ def notify_new(account: dict, unread_ids: list[str], access_token: str) -> None:
         return
     new_ids = [message_id for message_id in unread_ids if message_id not in previous]
     if new_ids:
+        sender_name = ""
+        subject = "New unread mail"
         try:
             newest = fetch_metadata(access_token, new_ids[:1])[0]
-            subject = newest.get("subject") or "New unread email"
+            sender_name, _sender_address = parseaddr(str(newest.get("from", "")))
+            sender_name = sender_name.strip()[:160]
+            subject = str(newest.get("subject") or subject).strip()[:240]
         except (NotifierError, IndexError):
-            subject = f"{len(new_ids)} new unread message(s)"
+            pass
+        initial = str(account.get("initial", "?")).strip()[:7] or "?"
+        heading = "Nuevo email en la cuenta" if language == "es" else "New email in account"
+        sender_text = escape(sender_name, quote=False) if sender_name else ""
+        notification_headline = f"{heading} ({escape(initial, quote=False)})"
+        subject_text = escape(subject, quote=False)
+        notification_body = (
+            f"<b>{sender_text}</b>\n{subject_text}" if sender_text else subject_text
+        )
         subprocess.run(
             [
-                "notify-send",
-                "--icon=mail-unread",
-                "--app-name=Gmail Notifier",
-                "--",
-                "Gmail · " + account["email"],
-                str(subject),
+                "omarchy-notification-send",
+                "--app-name",
+                "Gmail Notifier",
+                "--icon",
+                "mail-unread",
+                "-u",
+                "normal",
+                "--transient",
+                notification_headline,
+                notification_body,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -553,7 +576,7 @@ def build_snapshot(force: bool = False) -> dict:
                 unread_ids = list_unread_ids(access_token)
                 AlertStore(APP_DIR).observe(account["id"], unread_ids,
                     config.get("flash_until_clicked", False), config.get("flash_duration_seconds", 60))
-                notify_new(account, unread_ids, access_token)
+                notify_new(account, unread_ids, access_token, config.get("language", "en"))
                 messages, details_ready = read_details_cache(account["email"], unread_ids)
                 account["messages"] = messages
                 account["unread_count"] = len(unread_ids)
