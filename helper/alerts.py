@@ -8,6 +8,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from storage import locked, read_object, atomic_write, StorageError
 
 
 class AlertStore:
@@ -17,28 +18,25 @@ class AlertStore:
 
     def read(self):
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (FileNotFoundError, json.JSONDecodeError):
+            state = read_object(self.path) or {}
+            return {key: value for key, value in state.items()
+                    if isinstance(key, str) and isinstance(value, dict)
+                    and isinstance(value.get('unread_ids'), list)
+                    and len(value['unread_ids']) <= 10000
+                    and all(isinstance(i, str) for i in value['unread_ids'])
+                    and isinstance(value.get('started_at', 0), (int, float))
+                    and isinstance(value.get('expires_at', 0), (int, float))}
+        except StorageError:
             return {}
 
     @contextmanager
     def transaction(self):
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with (self.directory / "alerts.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with locked(self.directory / 'alerts.lock'):
             value = self.read()
+            previous = json.dumps(value, sort_keys=True)
             yield value
-            fd, name = tempfile.mkstemp(prefix=".alerts-", dir=self.directory)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                    json.dump(value, stream)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(name, self.path)
-            finally:
-                if os.path.exists(name):
-                    os.unlink(name)
+            if json.dumps(value, sort_keys=True) != previous:
+                atomic_write(self.path, value)
 
     def observe(self, account_id, unread_ids, until_clicked, duration):
         with self.transaction() as state:
@@ -70,5 +68,6 @@ class AlertStore:
 
     def visible(self, accounts):
         state = self.read()
-        return {a["id"]: state[a["id"]] for a in accounts
+        return {a["id"]: {key: value for key, value in state[a["id"]].items() if key != "unread_ids"} for a in accounts
                 if a.get("enabled") is not False and a.get("id") in state}
+

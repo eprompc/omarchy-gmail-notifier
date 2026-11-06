@@ -1,5 +1,4 @@
 import QtQuick
-import QtQml.Models
 import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
@@ -16,7 +15,7 @@ BarWidget {
   property int pollIntervalMinutes: 2
   property int fontSizeOffset: 0
   property int panelWidth: 376
-  property string language: "en"
+  property string language: "auto"
   property string selectedAccountId: ""
   property bool settingsMode: false
   property string lastError: ""
@@ -25,8 +24,24 @@ BarWidget {
   property bool flashUntilClicked: false
   property var alerts: ({})
   property double flashClock: Date.now()
-  property var pendingAcks: []
-  property bool stateRefreshPending: false
+  property string stateEpoch: ""
+  property double stateRevision: -1
+  property bool connected: false
+  property var actionQueue: []
+  property var currentAction: []
+  property int requestSequence: 0
+  property bool isActionRunning: false
+  property string actionError: ""
+  Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
+  Connections {
+    target: Commons.I18n
+    function onLanguageChanged() { root.sendPacket(["language", Commons.I18n.language], 0) }
+  }
+  function tr(es, en) {
+    if (language === "es") return es
+    if (language === "en") return en
+    return strings.t(en, en)
+  }
 
   component EnvelopeIcon: Item {
     id: envelopeRoot
@@ -68,14 +83,14 @@ BarWidget {
     panelLoader.item.accounts = root.accounts
     panelLoader.item.selectedAccountId = root.selectedAccountId
     panelLoader.item.settingsMode = root.settingsMode
-    panelLoader.item.lastError = root.lastError
+    panelLoader.item.lastError = root.actionError || root.lastError
     panelLoader.item.oauthReady = root.oauthReady
     panelLoader.item.fontSizeOffset = root.fontSizeOffset
     panelLoader.item.panelWidth = root.panelWidth
     panelLoader.item.language = root.language
     panelLoader.item.flashDurationSeconds = root.flashDurationSeconds
     panelLoader.item.flashUntilClicked = root.flashUntilClicked
-    panelLoader.item.isActionRunning = actionProcess.running
+    panelLoader.item.isActionRunning = root.isActionRunning
   }
 
   function open() {
@@ -127,22 +142,45 @@ BarWidget {
 
   function stopFlashing(accountId) {
     var alert = alerts[accountId]
-    if (!alert || !alert.event_id) return
-    pendingAcks = pendingAcks.concat([[accountId, alert.event_id]])
-    sendNextAck()
+    if (alert && alert.event_id) sendPacket(["ack-alert", accountId, alert.event_id], 0)
   }
 
-  function sendNextAck() {
-    if (ackProcess.running || pendingAcks.length === 0) return
-    var args = pendingAcks[0]
-    pendingAcks = pendingAcks.slice(1)
-    ackProcess.command = ["python3", helperPath, "ack-alert"].concat(args)
-    ackProcess.running = true
+  function sendPacket(args, id) {
+    if (!connected) return false
+    clientProcess.write(JSON.stringify({args: args, request_id: id}) + "\n")
+    return true
   }
 
-  function refreshState() {
-    if (stateProcess.running) { stateRefreshPending = true; return }
-    stateProcess.running = true
+  function cancelAuthorization() { sendPacket(["cancel-auth"], 0) }
+
+  function receivePacket(value) {
+    try {
+      var packet = JSON.parse(value)
+      if (packet.type === "state") {
+        if (!connected) {
+          connected = true
+          actionError = ""
+          stateEpoch = packet.epoch
+          stateRevision = -1
+          sendPacket(["language", Commons.I18n.language], 0)
+        }
+        if (packet.epoch !== stateEpoch || Number(packet.revision) <= stateRevision) return
+        stateRevision = Number(packet.revision)
+        receiveSnapshot(value)
+      } else if (packet.type === "result" && packet.request_id === requestSequence) {
+        var completed = currentAction
+        currentAction = []
+        isActionRunning = false
+        if (packet.ok !== true) actionError = String(packet.error || "The requested action failed")
+        if (packet.ok === true && completed[0] === "update" && opened && !settingsMode)
+          actionQueue = actionQueue.concat([["details", selectedAccountId]])
+        injectPanel()
+        Qt.callLater(startNextAction)
+      }
+    } catch (error) {
+      actionError = "Invalid response from Gmail Notifier service"
+      injectPanel()
+    }
   }
 
   function receiveSnapshot(value) {
@@ -157,12 +195,13 @@ BarWidget {
         flashDurationSeconds = Math.max(5, Math.min(600, Number(result.flash_duration_seconds)))
       flashUntilClicked = result.flash_until_clicked === true
 
-      if (Array.isArray(result.accounts)) accounts = result.accounts
+      if (Array.isArray(result.accounts) && JSON.stringify(accounts) !== JSON.stringify(result.accounts))
+        accounts = result.accounts
       alerts = result.alerts || ({})
       pollIntervalMinutes = Number(result.poll_interval_minutes || 2)
       if (Number.isFinite(Number(result.font_size_offset))) fontSizeOffset = Number(result.font_size_offset)
       if (Number.isFinite(Number(result.panel_width))) panelWidth = Number(result.panel_width)
-      language = result.language === "en" ? "en" : "es"
+      language = ["en", "es"].indexOf(result.language) >= 0 ? result.language : "auto"
       oauthReady = result.oauth_ready === true
       lastError = String(result.error || "")
       injectPanel()
@@ -170,34 +209,27 @@ BarWidget {
       if (!settingsMode && selected && Model.messageCount(selected) === 0)
         selectedAnchor = manageButton
       injectPanel()
-      if (!settingsMode && opened && selected && selected.details_ready === false && !actionProcess.running)
-        runAction(["details", selectedAccountId])
     } catch (error) {
       lastError = "Invalid response from Gmail Notifier helper"
     }
   }
 
-  function actionFinished(value) {
-    try {
-      var result = JSON.parse(value)
-      if (result.ok !== true) {
-        lastError = String(result.error || "The requested action failed")
-        injectPanel()
-      } else refreshState()
-    } catch (error) {
-      lastError = "Invalid response from Gmail Notifier helper"
-      injectPanel()
-    }
+  function runAction(args) {
+    if (!connected) { actionError = "Gmail service is disconnected"; injectPanel(); return }
+    if (actionQueue.length >= 32) { actionError = "Too many queued actions"; injectPanel(); return }
+    actionQueue = actionQueue.concat([args])
+    startNextAction()
   }
 
-  function refresh() {
-    if (!snapshotProcess.running) snapshotProcess.running = true
-  }
-
-  function runAction(arguments) {
-    if (actionProcess.running) return
-    actionProcess.command = ["python3", helperPath].concat(arguments)
-    actionProcess.running = true
+  function startNextAction() {
+    if (isActionRunning || actionQueue.length === 0 || !connected) return
+    currentAction = actionQueue[0]
+    actionQueue = actionQueue.slice(1)
+    requestSequence += 1
+    actionError = ""
+    isActionRunning = true
+    sendPacket(currentAction, requestSequence)
+    injectPanel()
   }
 
   function applyAccountAction(action, accountId, value) {
@@ -216,79 +248,32 @@ BarWidget {
   onSelectedAccountIdChanged: injectPanel()
 
   Timer {
-    // Each bar instance refreshes the shared local snapshot frequently; the
-    // helper itself contacts Gmail only once per configured poll interval.
-    interval: 15000
+    interval: 250
+    running: Object.keys(root.alerts).some(function(id) { return root.isAccountFlashing(id) })
     repeat: true
+    onTriggered: root.flashClock = Date.now()
+  }
+
+  Timer {
+    id: reconnectTimer
+    interval: 2000
+    onTriggered: clientProcess.running = true
+  }
+
+  Process {
+    id: clientProcess
+    command: ["python3", root.helperPath, "watch"]
+    stdinEnabled: true
     running: true
-    onTriggered: root.refresh()
-  }
-
-  // Local state is independent of Gmail polling and remains live while paused.
-  Timer { interval: 250; running: true; repeat: true; onTriggered: root.flashClock = Date.now() }
-  Timer { interval: 5000; running: true; repeat: true; onTriggered: root.refreshState() }
-
-  Instantiator {
-    model: ["snapshot.json", "alerts.json", "config.json"]
-    delegate: FileView {
-      required property string modelData
-      path: Quickshell.env("HOME") + "/.config/omarchy/gmail-notifier/" + modelData
-      watchChanges: true
-      printErrors: false
-      onFileChanged: { reload(); root.refreshState() }
-    }
-  }
-
-  Process {
-    id: stateProcess
-    command: ["python3", root.helperPath, "state"]
-    stdout: StdioCollector { onStreamFinished: { if (text.length > 0) root.receiveSnapshot(text) } }
+    stdout: SplitParser { onRead: function(data) { root.receivePacket(data) } }
     onExited: {
-      if (root.stateRefreshPending) {
-        root.stateRefreshPending = false
-        Qt.callLater(root.refreshState)
-      }
-    }
-  }
-
-  Process {
-    id: ackProcess
-    stdout: StdioCollector { onStreamFinished: { if (text.length > 0) root.actionFinished(text) } }
-    onExited: {
-      root.refreshState()
-      Qt.callLater(root.sendNextAck)
-    }
-  }
-
-  Process {
-    id: snapshotProcess
-    command: ["python3", root.helperPath, "snapshot"]
-    stdout: StdioCollector {
-      id: snapshotOutput
-      // A periodic/manual Gmail poll returns the fresh account snapshot.
-      // Do not route it through actionFinished(), which only schedules a
-      // local-state refresh and would leave the visible counts stale.
-      onStreamFinished: { if (text.length > 0) root.receiveSnapshot(text) }
-    }
-    onExited: function(exitCode) {
-      if (exitCode !== 0 && snapshotOutput.text.length === 0)
-        root.lastError = "Gmail Notifier helper could not start"
-    }
-  }
-
-  Process {
-    id: actionProcess
-    onRunningChanged: root.injectPanel()
-    stdout: StdioCollector {
-      id: actionOutput
-      onStreamFinished: {
-        if (text.length > 0) root.actionFinished(text)
-      }
-    }
-    onExited: function(exitCode) {
-      if (exitCode !== 0 && actionOutput.text.length === 0)
-        root.lastError = "The requested action did not complete"
-      root.refresh()
+      root.connected = false
+      root.isActionRunning = false
+      root.actionQueue = []
+      root.currentAction = []
+      root.actionError = "Gmail service disconnected; pending actions were cancelled."
+      root.injectPanel()
+      reconnectTimer.restart()
     }
   }
 
@@ -315,7 +300,7 @@ BarWidget {
       labelVisible: false
       hasVisualContent: true
       fixedWidth: manageEnvelope.implicitWidth + scaledHorizontalMargin * 2
-      tooltipText: "Gmail settings and add accounts"
+      tooltipText: root.tr("Configuración de Gmail y añadir cuentas", "Gmail settings and add accounts")
       onPressed: function(buttonCode) {
         if (buttonCode === Qt.LeftButton) root.showSettings(manageButton)
       }
@@ -335,7 +320,7 @@ BarWidget {
         required property var modelData
         readonly property var account: modelData
         readonly property int unreadCount: account.enabled === false ? 0 : Model.messageCount(account)
-        readonly property bool flashOn: Model.alertPhase(root.alerts[account.id], root.flashClock)
+        readonly property bool flashOn: Style.duration(1) === 0 || Model.alertPhase(root.alerts[account.id], root.flashClock)
         readonly property bool isFlashing: root.isAccountFlashing(account.id)
         bar: root.bar
         horizontalMargin: 2.5
@@ -344,8 +329,11 @@ BarWidget {
         hasVisualContent: true
         fixedWidth: accountLabel.implicitWidth + scaledHorizontalMargin * 2
         tooltipText: Model.escapeMarkup(account.enabled === false
-          ? account.email + " — paused (click to manage)"
-          : account.email + " — " + Model.messageCount(account) + " unread")
+          ? root.tr("%1 — pausada", "%1 — paused").arg(account.email)
+          : (root.language === "auto"
+            ? strings.tn("account.unread", Model.messageCount(account))
+            : root.tr("%1 — %2 sin leer", "%1 — %2 unread"))
+              .arg(account.email).arg(Commons.I18n.formatNumber(Model.messageCount(account))))
         onPressed: function(buttonCode) {
           root.stopFlashing(account.id)
           if (buttonCode === Qt.LeftButton) {
@@ -389,7 +377,7 @@ BarWidget {
             Text {
               id: countLabel
               anchors.centerIn: parent
-              text: accountButton.unreadCount > 99 ? "99+" : String(accountButton.unreadCount)
+              text: accountButton.unreadCount > 99 ? "99+" : Commons.I18n.formatNumber(accountButton.unreadCount)
               textFormat: Text.PlainText
               color: countBadge.flashFill ? Color.background
                 : countBadge.active ? accountButton.activeColor
@@ -408,6 +396,7 @@ BarWidget {
 
   }
 
-  Component.onCompleted: { refreshState(); refresh() }
+
 }
+
 
