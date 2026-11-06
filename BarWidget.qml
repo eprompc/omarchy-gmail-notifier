@@ -1,4 +1,5 @@
 import QtQuick
+import QtQml.Models
 import QtQuick.Effects
 import Quickshell
 import Quickshell.Io
@@ -22,8 +23,10 @@ BarWidget {
   property bool oauthReady: false
   property int flashDurationSeconds: 60
   property bool flashUntilClicked: false
-  property var flashUntilById: ({})
-  property bool hasReceivedSnapshot: false
+  property var alerts: ({})
+  property double flashClock: Date.now()
+  property var pendingAcks: []
+  property bool stateRefreshPending: false
 
   component EnvelopeIcon: Item {
     id: envelopeRoot
@@ -119,32 +122,27 @@ BarWidget {
   }
 
   function isAccountFlashing(accountId) {
-    var val = flashUntilById[accountId]
-    if (val === undefined) return false
-    if (val === true) return true
-    return Number(val || 0) > Date.now()
+    return Model.isAlertActive(alerts[accountId], flashClock)
   }
 
   function stopFlashing(accountId) {
-    if (flashUntilById[accountId] !== undefined) {
-      var next = Object.assign({}, flashUntilById)
-      delete next[accountId]
-      flashUntilById = next
-    }
+    var alert = alerts[accountId]
+    if (!alert || !alert.event_id) return
+    pendingAcks = pendingAcks.concat([[accountId, alert.event_id]])
+    sendNextAck()
   }
 
-  function clearExpiredFlashes() {
-    var now = Date.now()
-    var next = ({})
-    var changed = false
-    for (var id in flashUntilById) {
-      if (flashUntilById[id] === true || Number(flashUntilById[id]) > now) {
-        next[id] = flashUntilById[id]
-      } else {
-        changed = true
-      }
-    }
-    if (changed) flashUntilById = next
+  function sendNextAck() {
+    if (ackProcess.running || pendingAcks.length === 0) return
+    var args = pendingAcks[0]
+    pendingAcks = pendingAcks.slice(1)
+    ackProcess.command = ["python3", helperPath, "ack-alert"].concat(args)
+    ackProcess.running = true
+  }
+
+  function refreshState() {
+    if (stateProcess.running) { stateRefreshPending = true; return }
+    stateProcess.running = true
   }
 
   function receiveSnapshot(value) {
@@ -159,41 +157,8 @@ BarWidget {
         flashDurationSeconds = Math.max(5, Math.min(600, Number(result.flash_duration_seconds)))
       flashUntilClicked = result.flash_until_clicked === true
 
-      if (Array.isArray(result.accounts)) {
-        var merged = []
-        var nextFlashes = ({})
-        var now = Date.now()
-        for (var oldId in flashUntilById) {
-          if (flashUntilById[oldId] === true || Number(flashUntilById[oldId]) > now)
-            nextFlashes[oldId] = flashUntilById[oldId]
-        }
-        for (var i = 0; i < result.accounts.length; i++) {
-          var incoming = result.accounts[i]
-          var previous = null
-          for (var j = 0; j < accounts.length; j++) {
-            if (accounts[j].id === incoming.id) { previous = accounts[j]; break }
-          }
-          if (previous) {
-            if (incoming.last_error) {
-              incoming.unread_count = previous.unread_count
-              incoming.messages = previous.messages
-              incoming.details_ready = previous.details_ready
-            }
-            if (hasReceivedSnapshot && !incoming.last_error
-                && Model.messageCount(incoming) > Model.messageCount(previous)) {
-              if (root.flashUntilClicked) {
-                nextFlashes[incoming.id] = true
-              } else {
-                nextFlashes[incoming.id] = now + Math.max(5000, root.flashDurationSeconds * 1000)
-              }
-            }
-          }
-          merged.push(incoming)
-        }
-        accounts = merged
-        flashUntilById = nextFlashes
-        hasReceivedSnapshot = true
-      }
+      if (Array.isArray(result.accounts)) accounts = result.accounts
+      alerts = result.alerts || ({})
       pollIntervalMinutes = Number(result.poll_interval_minutes || 2)
       if (Number.isFinite(Number(result.font_size_offset))) fontSizeOffset = Number(result.font_size_offset)
       if (Number.isFinite(Number(result.panel_width))) panelWidth = Number(result.panel_width)
@@ -209,6 +174,19 @@ BarWidget {
         runAction(["details", selectedAccountId])
     } catch (error) {
       lastError = "Invalid response from Gmail Notifier helper"
+    }
+  }
+
+  function actionFinished(value) {
+    try {
+      var result = JSON.parse(value)
+      if (result.ok !== true) {
+        lastError = String(result.error || "The requested action failed")
+        injectPanel()
+      } else refreshState()
+    } catch (error) {
+      lastError = "Invalid response from Gmail Notifier helper"
+      injectPanel()
     }
   }
 
@@ -242,8 +220,44 @@ BarWidget {
     // helper itself contacts Gmail only once per configured poll interval.
     interval: 15000
     repeat: true
-    running: Model.enabledAccounts(root.accounts).length > 0
+    running: true
     onTriggered: root.refresh()
+  }
+
+  // Local state is independent of Gmail polling and remains live while paused.
+  Timer { interval: 250; running: true; repeat: true; onTriggered: root.flashClock = Date.now() }
+  Timer { interval: 5000; running: true; repeat: true; onTriggered: root.refreshState() }
+
+  Instantiator {
+    model: ["snapshot.json", "alerts.json", "config.json"]
+    delegate: FileView {
+      required property string modelData
+      path: Quickshell.env("HOME") + "/.config/omarchy/gmail-notifier/" + modelData
+      watchChanges: true
+      printErrors: false
+      onFileChanged: { reload(); root.refreshState() }
+    }
+  }
+
+  Process {
+    id: stateProcess
+    command: ["python3", root.helperPath, "state"]
+    stdout: StdioCollector { onStreamFinished: { if (text.length > 0) root.receiveSnapshot(text) } }
+    onExited: {
+      if (root.stateRefreshPending) {
+        root.stateRefreshPending = false
+        Qt.callLater(root.refreshState)
+      }
+    }
+  }
+
+  Process {
+    id: ackProcess
+    stdout: StdioCollector { onStreamFinished: { if (text.length > 0) root.actionFinished(text) } }
+    onExited: {
+      root.refreshState()
+      Qt.callLater(root.sendNextAck)
+    }
   }
 
   Process {
@@ -251,7 +265,10 @@ BarWidget {
     command: ["python3", root.helperPath, "snapshot"]
     stdout: StdioCollector {
       id: snapshotOutput
-      onStreamFinished: root.receiveSnapshot(text)
+      // A periodic/manual Gmail poll returns the fresh account snapshot.
+      // Do not route it through actionFinished(), which only schedules a
+      // local-state refresh and would leave the visible counts stale.
+      onStreamFinished: { if (text.length > 0) root.receiveSnapshot(text) }
     }
     onExited: function(exitCode) {
       if (exitCode !== 0 && snapshotOutput.text.length === 0)
@@ -261,10 +278,11 @@ BarWidget {
 
   Process {
     id: actionProcess
+    onRunningChanged: root.injectPanel()
     stdout: StdioCollector {
       id: actionOutput
       onStreamFinished: {
-        if (text.length > 0) root.receiveSnapshot(text)
+        if (text.length > 0) root.actionFinished(text)
       }
     }
     onExited: function(exitCode) {
@@ -317,7 +335,7 @@ BarWidget {
         required property var modelData
         readonly property var account: modelData
         readonly property int unreadCount: account.enabled === false ? 0 : Model.messageCount(account)
-        property bool flashOn: false
+        readonly property bool flashOn: Model.alertPhase(root.alerts[account.id], root.flashClock)
         readonly property bool isFlashing: root.isAccountFlashing(account.id)
         bar: root.bar
         horizontalMargin: 2.5
@@ -325,12 +343,11 @@ BarWidget {
         labelVisible: false
         hasVisualContent: true
         fixedWidth: accountLabel.implicitWidth + scaledHorizontalMargin * 2
-        tooltipText: account.enabled === false
+        tooltipText: Model.escapeMarkup(account.enabled === false
           ? account.email + " — paused (click to manage)"
-          : account.email + " — " + Model.messageCount(account) + " unread"
+          : account.email + " — " + Model.messageCount(account) + " unread")
         onPressed: function(buttonCode) {
           root.stopFlashing(account.id)
-          accountButton.flashOn = false
           if (buttonCode === Qt.LeftButton) {
             if (account.enabled === false) root.showSettings(accountButton)
             else root.showAccount(account.id, accountButton)
@@ -386,24 +403,11 @@ BarWidget {
             }
           }
         }
-
-        Timer {
-          interval: 500
-          repeat: true
-          running: accountButton.isFlashing
-          onTriggered: {
-            if (!root.isAccountFlashing(accountButton.account.id)) {
-              accountButton.flashOn = false
-              root.clearExpiredFlashes()
-            } else {
-              accountButton.flashOn = !accountButton.flashOn
-            }
-          }
-        }
       }
     }
 
   }
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: { refreshState(); refresh() }
 }
+

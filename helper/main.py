@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import base64
 import copy
+from email.utils import parseaddr
 import fcntl
 import hashlib
 import http.server
 import json
+from html import escape
 import os
 import secrets
 import subprocess
@@ -24,6 +26,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
+from alerts import AlertStore
 
 
 APP_DIR = Path.home() / ".config" / "omarchy" / "gmail-notifier"
@@ -35,6 +38,10 @@ CACHE_DIR = Path.home() / ".cache" / "omarchy" / "gmail-notifier"
 TOKEN_APP = "gmail-notifier"
 GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.metadata"
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_UNREAD_IDS = 10000
+MAX_DETAIL_MESSAGES = 500
+MAX_HEADER_CHARS = 4096
 DEFAULT_CONFIG = {
     "version": 1,
     "poll_interval_minutes": 2,
@@ -159,6 +166,7 @@ def snapshot_result(config: dict, snapshot: dict | None) -> dict:
     errors = [f"{a.get('email', 'Account')}: {a['last_error']}" for a in accounts if a.get("last_error")]
     return {
         "ok": True,
+        "alerts": AlertStore(APP_DIR).visible(accounts),
         "accounts": accounts,
         "poll_interval_minutes": config["poll_interval_minutes"],
         "flash_duration_seconds": config.get("flash_duration_seconds", 60),
@@ -175,6 +183,19 @@ def emit(data: dict) -> None:
     print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
 
 
+def read_json_response(response) -> dict:
+    payload = response.read(MAX_HTTP_RESPONSE_BYTES + 1)
+    if len(payload) > MAX_HTTP_RESPONSE_BYTES:
+        raise NotifierError("Google response was too large; the previous state is kept.")
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise NotifierError("Google returned an invalid JSON response.") from None
+    if not isinstance(value, dict):
+        raise NotifierError("Google returned an unexpected response.")
+    return value
+
+
 def api_json(url: str, access_token: str) -> dict:
     request = urllib.request.Request(
         url,
@@ -182,7 +203,7 @@ def api_json(url: str, access_token: str) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return read_json_response(response)
     except urllib.error.HTTPError as error:
         if error.code == 401:
             raise NotifierError("Google authorization expired; reconnect this account.") from None
@@ -241,7 +262,7 @@ def token_request(form: dict) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return read_json_response(response)
     except urllib.error.HTTPError as error:
         raise NotifierError(f"Google OAuth returned HTTP {error.code}.") from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
@@ -399,14 +420,21 @@ def list_unread_ids(access_token: str) -> list[str]:
             params.append(("pageToken", page_token))
         url = f"{GMAIL_API}/messages?{urllib.parse.urlencode(params)}"
         page = gmail_request(url, access_token)
-        unread_ids.extend(item["id"] for item in page.get("messages", []) if item.get("id"))
-        page_token = str(page.get("nextPageToken", ""))
+        items = page.get("messages", [])
+        if not isinstance(items, list):
+            raise NotifierError("Google returned an unexpected message list.")
+        unread_ids.extend(item.get("id") for item in items if isinstance(item, dict) and item.get("id"))
+        if len(unread_ids) > MAX_UNREAD_IDS:
+            raise NotifierError("This account has too many unread messages to display safely.")
+        page_token = str(page.get("nextPageToken", ""))[:512]
         if not page_token:
             break
     return unread_ids
 
 
 def fetch_metadata(access_token: str, message_ids: list[str]) -> list[dict]:
+    if len(message_ids) > MAX_DETAIL_MESSAGES:
+        raise NotifierError("Too many unread messages to load safely; narrow the inbox and try again.")
     summaries: list[dict] = []
     for message_id in message_ids:
         params = urllib.parse.urlencode([
@@ -415,9 +443,12 @@ def fetch_metadata(access_token: str, message_ids: list[str]) -> list[dict]:
             ("metadataHeaders", "Subject"),
         ])
         message = gmail_request(f"{message_url(message_id)}?{params}", access_token)
+        payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+        raw_headers = payload.get("headers", []) if isinstance(payload, dict) else []
         headers = {
-            str(header.get("name", "")).lower(): str(header.get("value", ""))
-            for header in message.get("payload", {}).get("headers", [])
+            str(header.get("name", "")).lower(): str(header.get("value", ""))[:MAX_HEADER_CHARS]
+            for header in raw_headers
+            if isinstance(header, dict)
         }
         summaries.append({
             "id": message_id,
@@ -461,7 +492,12 @@ def write_details_cache(email: str, unread_ids: list[str], messages: list[dict])
             pass
 
 
-def notify_new(account: dict, unread_ids: list[str], access_token: str) -> None:
+def notify_new(
+    account: dict,
+    unread_ids: list[str],
+    access_token: str,
+    language: str = "en",
+) -> None:
     if account.get("notifications") is False:
         account["last_notification_ids"] = unread_ids
         account["notification_baseline_set"] = True
@@ -473,19 +509,35 @@ def notify_new(account: dict, unread_ids: list[str], access_token: str) -> None:
         return
     new_ids = [message_id for message_id in unread_ids if message_id not in previous]
     if new_ids:
+        sender_name = ""
+        subject = "New unread mail"
         try:
             newest = fetch_metadata(access_token, new_ids[:1])[0]
-            subject = newest.get("subject") or "New unread email"
+            sender_name, _sender_address = parseaddr(str(newest.get("from", "")))
+            sender_name = sender_name.strip()[:160]
+            subject = str(newest.get("subject") or subject).strip()[:240]
         except (NotifierError, IndexError):
-            subject = f"{len(new_ids)} new unread message(s)"
+            pass
+        initial = str(account.get("initial", "?")).strip()[:7] or "?"
+        heading = "Nuevo email en la cuenta" if language == "es" else "New email in account"
+        sender_text = escape(sender_name, quote=False) if sender_name else ""
+        notification_headline = f"{heading} ({escape(initial, quote=False)})"
+        subject_text = escape(subject, quote=False)
+        notification_body = (
+            f"<b>{sender_text}</b>\n{subject_text}" if sender_text else subject_text
+        )
         subprocess.run(
             [
-                "notify-send",
-                "--icon=mail-unread",
-                "--app-name=Gmail Notifier",
-                "--",
-                "Gmail · " + account["email"],
-                str(subject),
+                "omarchy-notification-send",
+                "--app-name",
+                "Gmail Notifier",
+                "--icon",
+                "mail-unread",
+                "-u",
+                "normal",
+                "--transient",
+                notification_headline,
+                notification_body,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -522,7 +574,9 @@ def build_snapshot(force: bool = False) -> dict:
                 token = token_lookup(account["email"])
                 access_token, _token = refresh_access_token(account["email"], token)
                 unread_ids = list_unread_ids(access_token)
-                notify_new(account, unread_ids, access_token)
+                AlertStore(APP_DIR).observe(account["id"], unread_ids,
+                    config.get("flash_until_clicked", False), config.get("flash_duration_seconds", 60))
+                notify_new(account, unread_ids, access_token, config.get("language", "en"))
                 messages, details_ready = read_details_cache(account["email"], unread_ids)
                 account["messages"] = messages
                 account["unread_count"] = len(unread_ids)
@@ -698,6 +752,7 @@ def remove_account(account_id: str) -> int:
     if account is None:
         emit({"ok": False, "error": "Account not found"})
         return 1
+    AlertStore(APP_DIR).remove(account_id)
     token_clear(account["email"])
     try:
         account_cache_path(account["email"]).unlink()
@@ -715,6 +770,13 @@ def main(argv: list[str]) -> int:
             emit(build_snapshot())
             return 0
         command, *args = argv
+        if command == "state" and not args:
+            emit(snapshot_result(load_config(), load_runtime_snapshot()))
+            return 0
+        if command == "ack-alert" and len(args) == 2:
+            AlertStore(APP_DIR).acknowledge(args[0], args[1])
+            emit(snapshot_result(load_config(), load_runtime_snapshot()))
+            return 0
         if command in ("update", "refresh"):
             emit(build_snapshot(force=True))
             return 0
@@ -747,3 +809,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+

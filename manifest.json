@@ -12,6 +12,7 @@
   },
   "barWidget": {
     "displayName": "Gmail Notifier",
+    "description": "Shows unread Gmail accounts in the Omarchy bar and keeps new-mail alerts synchronized across monitors.",
     "category": "Productivity",
     "allowMultiple": false,
     "defaultSection": "left"
