@@ -1,5 +1,11 @@
 # Review tasks 7–18
 
+## Follow-up: refresh scheduling (0.3.1 candidate)
+
+The owner's report of intermittent frozen polling prompted the isolated branch `fix/refresh-scheduling`. The candidate implements shared busy state, overlap rejection, per-account process deadlines, worker recovery, monotonic periodic scheduling and nonblocking monitor delivery. Automated coverage is added in `tests/test_refresh_scheduling.py` and `tests/widget.test.cjs`. Desktop acceptance is **pending**; see [REFRESH_TESTING.md](REFRESH_TESTING.md). This follow-up does not invalidate or extend the historical 0.3.0 acceptance below.
+
+## Historical audit
+
 Version 0.3.0 follows the audit of main at 5adaad8. Tasks 7–18 are implemented. The owner confirmed successful desktop testing and approved integration on 2026-11-06; evidence and its limits are recorded in ACCEPTANCE.md. Marketplace approval is a separate maintainer decision.
 
 | Task | Implementation | Evidence / remaining check |
