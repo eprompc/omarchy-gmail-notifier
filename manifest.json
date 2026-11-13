@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "eprom.gmail-notifier",
   "name": "Gmail Notifier",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "author": "Eprom",
   "license": "GPL-3.0",
   "description": "A lightweight per-account Gmail unread indicator for the Omarchy bar.",

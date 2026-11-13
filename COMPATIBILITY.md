@@ -20,6 +20,8 @@ Configuration migrations add defaults without changing existing account IDs or p
 
 These checks are part of CI and are release requirements for future changes. Keep fixtures for supported persisted formats as versions evolve.
 
+The OAuth setup help and `check-setup` action are read-only with respect to accounts, client JSON and credentials. Missing/invalid/unreadable client status must not erase authorization, overwrite the client, start OAuth automatically, or block an otherwise usable saved access token. Restoring the original client must permit refresh of its existing grant. These cases are covered by `tests/test_oauth_setup.py`; saved accounts receive a recovery guide rather than instructions to create a replacement client.
+
 ## What an update cannot guarantee
 
 Google can revoke a grant or expire a refresh token independently of plugin updates. External OAuth apps in Google's Testing state can receive time-limited refresh tokens. Deleting an account, clearing the keyring, changing the OAuth client, or having a locked/unavailable Secret Service also changes access independently of source updates. The plugin must distinguish these cases, retain personal state and explain the next action. It must not claim that an external grant will remain valid forever.

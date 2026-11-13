@@ -31,5 +31,12 @@
   "account.unread": {
     "one": "%1 — %2 mensaje sin leer",
     "other": "%1 — %2 mensajes sin leer"
-  }
+  },
+  "The plugin is installed. Set up Google sign-in.": "El plugin está instalado. Configura el acceso con Google.",
+  "Your accounts are still saved. Help explains how to restore your original client file without deleting anything.": "Tus cuentas siguen guardadas. La ayuda explica cómo recuperar tu archivo original sin borrar nada.",
+  "You need your OAuth client file. Choose HELP for simple steps with links to Google.": "Necesitas tu archivo de cliente OAuth. Pulsa AYUDA y sigue los pasos con enlaces a Google.",
+  "HELP — Set up Google": "AYUDA — Configurar Google",
+  "HELP — Google sign-in guide": "AYUDA — Acceso con Google",
+  "The Google file is not a valid Desktop app JSON. HELP explains how to check it.": "El archivo de Google no es un JSON válido de escritorio. AYUDA explica cómo comprobarlo.",
+  "The Google file cannot be read. HELP explains its location and permissions.": "No se puede leer el archivo de Google. AYUDA explica dónde guardarlo y sus permisos."
 }

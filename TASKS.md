@@ -1,5 +1,9 @@
 # Review tasks 7–18
 
+## Follow-up: OAuth setup help (0.3.2 candidate)
+
+The focused branch `fix/oauth-setup-help` adds a prominent bilingual help entry for missing/invalid/unreadable Google client files, an eight-step first-install guide, a separate three-step recovery route for saved accounts, official Google links and a read-only setup check. Account/client/credential continuity remains a permanent requirement. Automated upgrade/recovery and localized Qt guide checks are included; actual Omarchy desktop acceptance remains pending in [OAUTH_HELP_TESTING.md](OAUTH_HELP_TESTING.md). The focused help PR builds on the 0.3.1 refresh candidate; both must be tested and integrated in order before release.
+
 ## Follow-up: refresh scheduling (0.3.1 candidate)
 
 The owner's report of intermittent frozen polling prompted the isolated branch `fix/refresh-scheduling`. The candidate implements shared busy state, overlap rejection, per-account process deadlines, worker recovery, monotonic periodic scheduling and nonblocking monitor delivery. Automated coverage is added in `tests/test_refresh_scheduling.py` and `tests/widget.test.cjs`. Desktop acceptance is **pending**; see [REFRESH_TESTING.md](REFRESH_TESTING.md). This follow-up does not invalidate or extend the historical 0.3.0 acceptance below.
