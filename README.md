@@ -29,6 +29,7 @@ A lightweight personal Omarchy bar widget that checks multiple Gmail accounts wi
 - Settings follow Omarchy’s live language with English fallback and a Spanish catalog; explicit English/Spanish overrides are available, use compact theme-styled buttons, and require an explicit confirmation before removing an account. The account label field has a visible outline. The panel starts at 376 px and can be resized in settings.
 - All monitors share one local service and ordered state revisions. Clicking an account stops that alert everywhere, including while Gmail is busy. Each widget keeps one persistent client; there are no recurring Python process launches per monitor. Configuration edits use a short transaction and file replacement, so simultaneous edits cannot overwrite each other.
 - Google OAuth runs in the system default browser with PKCE and a loopback callback. Chrome/Chromium is not required; Zen Browser works when it is the default browser.
+- A prominent **HELP / AYUDA** button guides first-time users through their Google client setup in English or Spanish. Existing accounts get a recovery guide that preserves the original client and saved authorization.
 
 ## Installation
 
@@ -79,28 +80,15 @@ The plugin reads a Google Desktop OAuth client configuration from:
 
 ### Creating your OAuth client
 
-1. In the [Google Cloud Console](https://console.cloud.google.com/), create a project and enable the **Gmail API**.
-2. Configure the **OAuth consent screen** (External, add test user emails if in Testing mode). The app requests only the `https://www.googleapis.com/auth/gmail.metadata` scope.
-3. Under **Credentials**, create an OAuth client ID with application type **Desktop app**.
-4. Download the JSON or format it as follows:
+Open the envelope → **HELP — Set up Google**. The eight-step guide follows the plugin/system language and explains each Google screen, with official links. You can also read the same instructions in [English](docs/OAUTH_SETUP.en.md) or [español](docs/OAUTH_SETUP.es.md).
 
-```json
-{
-  "installed": {
-    "client_id": "YOUR_CLIENT_ID.apps.googleusercontent.com",
-    "client_secret": "YOUR_CLIENT_SECRET"
-  }
-}
-```
+In brief: select your Google Cloud project, enable Gmail API, configure **Google Auth Platform → Branding / Audience / Data Access**, request only `https://www.googleapis.com/auth/gmail.metadata`, then create a **Desktop app** under **Clients** and download its JSON. Keep the whole downloaded file at the path above, private to your user (folder `0700`, file `0600`). The guide explains the file-manager steps and permissions. Do not upload this file to GitHub or paste it into support chats.
 
-5. Save it to `~/.config/omarchy/gmail-notifier/oauth-client.json` with permissions `600`:
+**Check setup** only validates the local client file and rereads saved state. It does not launch OAuth or change accounts, settings or credentials. Saving/restoring the file is detected automatically, without restarting the plugin. Missing, invalid and unreadable files get distinct guidance.
 
-```bash
-mkdir -p -m 700 ~/.config/omarchy/gmail-notifier
-chmod 600 ~/.config/omarchy/gmail-notifier/oauth-client.json
-```
+**Existing users:** plugin updates must reuse saved accounts and usable authorization. Keep the same OAuth client. If it is missing, restore the **original** JSON from your own computer/private backup; creating a different client does not restore its predecessor's grants. The help switches to a recovery guide when saved accounts exist. A new computer needs its own one-time account connection because saved tokens live in that computer's private keyring.
 
-Google classifies `gmail.metadata` as a restricted scope. An external OAuth app left in Testing issues refresh tokens that expire after seven days; see [Gmail API scopes](https://developers.google.com/workspace/gmail/api/auth/scopes) and [OAuth refresh token behavior](https://developers.google.com/identity/protocols/oauth2).
+Google classifies `gmail.metadata` as restricted. For regular use, review **Audience → Publishing status** before your first sign-in: an External app left in **Testing** grants access for seven days. The guide explains **In production**, Google's possible verification/organization requirements, and the distinction between an update and an externally expired/revoked grant. See [Google's audience guidance](https://support.google.com/cloud/answer/15549945) and [OAuth expiry rules](https://developers.google.com/identity/protocols/oauth2#expiration).
 
 ### Authorizing accounts
 
@@ -123,3 +111,5 @@ State and header caches are private to your user (directory mode 0700, files 060
 Removing an account clears its saved local authorizations and header cache; it does not revoke the grant on Google’s servers. To revoke it there, use your Google Account’s third-party connections page. A failed local secret deletion is reported and leaves the account configured so that you can retry.
 
 For branch installation, regression checks, desktop acceptance and rollback instructions, see [TESTING.md](TESTING.md). The implementation and outstanding manual checks for the review tasks are tracked in [TASKS.md](TASKS.md). The permanent update requirements and regression coverage are documented in [COMPATIBILITY.md](COMPATIBILITY.md): source updates must preserve settings and usable saved authorization.
+
+For this OAuth help candidate's specific checks and acceptance limits, see [OAUTH_HELP_TESTING.md](OAUTH_HELP_TESTING.md).

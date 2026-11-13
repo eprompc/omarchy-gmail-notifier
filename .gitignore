@@ -10,3 +10,4 @@ snapshot.json
 snapshot.lock
 *.lock
 personal-config/
+artifacts/

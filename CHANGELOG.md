@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.2 — candidate, OAuth setup help
+
+- Show a prominent HELP / AYUDA button when the Google client is missing, invalid or unreadable; explain that the plugin itself is installed.
+- Add an eight-step English/Spanish Google setup guide with official links, selectable paths/commands, navigation, setup checks and troubleshooting. Follow system language with an English fallback.
+- Give saved accounts a separate recovery guide that restores the original client instead of creating a replacement or repeating authorization.
+- Detect a saved/restored client without restarting the plugin. Setup checks read local state only and never open OAuth, write the client or modify saved tokens/settings.
+- Keep the stable plugin ID, storage schema/paths, Secret Service attributes and Google scope. Add update/recovery regressions and Qt guide rendering checks.
+
+This focused help change builds on the 0.3.1 refresh candidate, so both can be tested together. Release integration must include and validate both changes in order; this document does not mark either candidate accepted on the desktop.
+
 ## 0.3.1 — candidate, desktop acceptance pending
 
 - Share network busy state across monitors, disable refresh/load controls during queries, and reject overlapping network requests without building a queue.

@@ -18,6 +18,7 @@ import math
 from html import escape
 import os
 import secrets
+import stat
 import sys
 import tempfile
 import time
@@ -227,6 +228,7 @@ def merge_runtime_accounts(config: dict, snapshot: dict | None) -> list[dict]:
 
 
 def snapshot_result(config: dict, snapshot: dict | None) -> dict:
+    oauth_status = oauth_client_status()
     accounts = merge_runtime_accounts(config, snapshot)
     for account in accounts:
         for key in ("unread_ids", "last_notification_ids", "notification_baseline_set", "generation"):
@@ -244,7 +246,8 @@ def snapshot_result(config: dict, snapshot: dict | None) -> dict:
         "panel_width": config["panel_width"],
         "language": config["language"],
         "effective_language": effective_language(config["language"]),
-        "oauth_ready": OAUTH_CLIENT_PATH.is_file(),
+        "oauth_ready": oauth_status == "ready",
+        "oauth_status": oauth_status,
         "error": "; ".join(errors),
     }
 
@@ -404,6 +407,22 @@ def read_oauth_client() -> dict:
         ) from None
     except (json.JSONDecodeError, AttributeError, ValueError, TypeError):
         raise NotifierError("The OAuth client file is invalid; use a Google Desktop app JSON.") from None
+
+
+def oauth_client_status() -> str:
+    """Read-only setup hint. Never touch accounts, tokens or OAuth authorization."""
+    try:
+        metadata = OAUTH_CLIENT_PATH.stat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+            return "invalid"
+        read_oauth_client()
+        return "ready"
+    except FileNotFoundError:
+        return "missing"
+    except NotifierError:
+        return "invalid"
+    except OSError:
+        return "unreadable"
 
 
 class OAuthCallback(http.server.BaseHTTPRequestHandler):
@@ -955,7 +974,7 @@ def main(argv: list[str]) -> int:
         command, *args = argv
         if command == 'poll-one' and len(args) == 2:
             return poll_one(args[0], args[1] == 'true')
-        if command == "state" and not args:
+        if command in ("state", "check-setup") and not args:
             emit(snapshot_result(load_config(), load_runtime_snapshot()))
             return 0
         if command == "ack-alert" and len(args) == 2:

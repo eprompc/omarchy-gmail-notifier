@@ -20,6 +20,7 @@ BarWidget {
   property bool settingsMode: false
   property string lastError: ""
   property bool oauthReady: false
+  property string oauthStatus: "missing"
   property int flashDurationSeconds: 60
   property bool flashUntilClicked: false
   property var alerts: ({})
@@ -87,6 +88,7 @@ BarWidget {
     panelLoader.item.settingsMode = root.settingsMode
     panelLoader.item.lastError = root.actionError || root.lastError
     panelLoader.item.oauthReady = root.oauthReady
+    panelLoader.item.oauthStatus = root.oauthStatus
     panelLoader.item.fontSizeOffset = root.fontSizeOffset
     panelLoader.item.panelWidth = root.panelWidth
     panelLoader.item.language = root.language
@@ -216,6 +218,7 @@ BarWidget {
       if (Number.isFinite(Number(result.panel_width))) panelWidth = Number(result.panel_width)
       language = ["en", "es"].indexOf(result.language) >= 0 ? result.language : "auto"
       oauthReady = result.oauth_ready === true
+      oauthStatus = String(result.oauth_status || (oauthReady ? "ready" : "missing"))
       lastError = String(result.error || result.network_error || "")
       injectPanel()
       var selected = Model.accountById(accounts, selectedAccountId)

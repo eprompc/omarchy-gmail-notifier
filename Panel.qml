@@ -19,6 +19,8 @@ Panel {
   property bool settingsMode: false
   property string lastError: ""
   property bool oauthReady: false
+  property string oauthStatus: "missing"
+  property bool helpMode: false
   property int fontSizeOffset: 0
   property int panelWidth: 376
   property string language: "auto"
@@ -103,6 +105,15 @@ Panel {
     var address = sender.match(/^([^@\s]+)@[^@\s]+$/)
     return address ? address[1] : sender
   }
+  function addAccount() {
+    if (!oauthReady) { showSetupHelp(); return }
+    lastError = ""
+    runAction(["add-account"])
+  }
+  function showSetupHelp() {
+    helpMode = true
+    contentScroll.contentY = 0
+  }
 
   KeyboardPanel {
     id: panel
@@ -153,7 +164,7 @@ Panel {
           }
 
           Text {
-            visible: root.lastError.length > 0
+            visible: root.lastError.length > 0 && !root.helpMode
             width: parent.width
             text: root.lastError
             textFormat: Text.PlainText
@@ -161,13 +172,80 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          Column {
+            visible: root.settingsMode && !root.oauthReady && !root.helpMode
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              width: parent.width
+              text: root.tr("El plugin está instalado. Configura el acceso con Google.", "The plugin is installed. Set up Google sign-in.")
+              textFormat: Text.PlainText
+              color: root.panelAccent
+              font.bold: true
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              width: parent.width
+              text: root.accounts.length > 0
+                ? root.tr("Tus cuentas siguen guardadas. La ayuda explica cómo recuperar tu archivo original sin borrar nada.", "Your accounts are still saved. Help explains how to restore your original client file without deleting anything.")
+                : root.oauthStatus === "invalid"
+                ? root.tr("El archivo de Google no es un JSON válido de escritorio. AYUDA explica cómo comprobarlo.", "The Google file is not a valid Desktop app JSON. HELP explains how to check it.")
+                : root.oauthStatus === "unreadable"
+                ? root.tr("No se puede leer el archivo de Google. AYUDA explica dónde guardarlo y sus permisos.", "The Google file cannot be read. HELP explains its location and permissions.")
+                : root.tr("Necesitas tu archivo de cliente OAuth. Pulsa AYUDA y sigue los pasos con enlaces a Google.", "You need your OAuth client file. Choose HELP for simple steps with links to Google.")
+              textFormat: Text.PlainText
+              color: root.foreground
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+            Ui.Button {
+              width: parent.width
+              text: root.tr("AYUDA — Configurar Google", "HELP — Set up Google")
+              iconText: "?"
+              bordered: true
+              focusable: true
+              foreground: root.panelAccent
+              accent: root.panelAccent
+              borderSpec: Border.flat(root.panelAccent, Math.max(2, Style.space(2)))
+              horizontalPadding: Style.space(12)
+              verticalPadding: Style.space(8)
+              onClicked: root.showSetupHelp()
+            }
+          }
+
           Loader {
             width: parent.width
             height: item ? item.implicitHeight : 0
-            sourceComponent: root.settingsMode ? settingsView : accountView
+            sourceComponent: root.settingsMode ? (root.helpMode ? setupHelpView : settingsView) : accountView
           }
         }
       }
+    }
+  }
+
+  Component {
+    id: setupHelpView
+    OAuthSetupHelp {
+      width: parent.width
+      language: root.language
+      oauthReady: root.oauthReady
+      oauthStatus: root.oauthStatus
+      hasAccounts: root.accounts.length > 0
+      actionRunning: root.isActionRunning
+      networkBusy: root.networkBusy
+      foreground: root.foreground
+      accent: root.panelAccent
+      fontSize: root.configuredFontSize
+      onBackRequested: { root.helpMode = false; contentScroll.contentY = 0 }
+      onCheckRequested: root.runAction(["check-setup"])
+      onConnectRequested: {
+        if (!root.oauthReady || root.accounts.length > 0) return
+        root.helpMode = false
+        contentScroll.contentY = 0
+        root.addAccount()
+      }
+      onNavigated: contentScroll.contentY = 0
     }
   }
 
@@ -208,11 +286,9 @@ Panel {
       }
 
       Text {
-        visible: root.accounts.length === 0
+        visible: root.accounts.length === 0 && root.oauthReady
         width: parent.width
-        text: root.oauthReady
-          ? root.tr("Aún no hay cuentas. Pulsa «Añadir cuenta de Gmail» para iniciar sesión con Google.", "No accounts linked yet. Choose “Add Gmail account” to sign in with Google.")
-          : root.tr("Google necesita un archivo OAuth de escritorio en ~/.config/omarchy/gmail-notifier/oauth-client.json. Configúralo antes de añadir una cuenta.", "Google sign-in needs a Desktop OAuth client JSON at ~/.config/omarchy/gmail-notifier/oauth-client.json. Set it up before adding an account.")
+        text: root.tr("Aún no hay cuentas. Pulsa «Añadir cuenta de Gmail» para iniciar sesión con Google.", "No accounts linked yet. Choose “Add Gmail account” to sign in with Google.")
         color: root.foreground
         wrapMode: Text.WordWrap
         font.pixelSize: Style.font.bodySmall
@@ -222,6 +298,24 @@ Panel {
         visible: root.isActionRunning && root.hostWidget && root.hostWidget.currentAction[0] === "add-account"
         text: root.tr("Cancelar autorización", "Cancel authorization")
         onClicked: root.hostWidget.cancelAuthorization()
+      }
+
+      // Add Gmail Account Button (Themed Success Green with thick border)
+      Ui.Button {
+        objectName: "addGmailAccountButton"
+        enabled: !root.oauthReady || (!root.isActionRunning && !root.networkBusy)
+        width: parent.width
+        text: root.tr("Añadir cuenta de Gmail", "Add Gmail account")
+        iconText: "\uf0e0"
+        leftAlign: true
+        bordered: true
+        focusable: true
+        foreground: root.themeGreen
+        accent: root.themeGreen
+        borderSpec: Border.flat(root.themeGreen, Math.max(2, Style.space(2)))
+        horizontalPadding: Style.space(12)
+        verticalPadding: Style.space(8)
+        onClicked: root.addAccount()
       }
 
       Repeater {
@@ -563,24 +657,16 @@ Panel {
         }
       }
 
-      // Add Gmail Account Button (Themed Success Green with thick border)
+
+
+
       Ui.Button {
+        visible: root.oauthReady
         width: parent.width
-        text: root.tr("Añadir cuenta de Gmail", "Add Gmail account")
-        enabled: !root.isActionRunning && !root.networkBusy
-        iconText: "\uf0e0"
-        leftAlign: true
+        text: root.tr("AYUDA — Acceso con Google", "HELP — Google sign-in guide")
         bordered: true
         focusable: true
-        foreground: root.themeGreen
-        accent: root.themeGreen
-        borderSpec: Border.flat(root.themeGreen, Math.max(2, Style.space(2)))
-        horizontalPadding: Style.space(12)
-        verticalPadding: Style.space(8)
-        onClicked: {
-          root.lastError = ""
-          root.runAction(["add-account"])
-        }
+        onClicked: root.showSetupHelp()
       }
 
       Text {

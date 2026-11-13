@@ -271,7 +271,7 @@ class Service:
             raise ValueError('Invalid action')
         allowed = {'ack-alert', 'details', 'more-details', 'update', 'set-enabled', 'set-initial',
                    'set-notifications', 'set-interval', 'set-display', 'move-account', 'remove-account',
-                   'add-account', 'cancel-auth', 'language'}
+                   'add-account', 'cancel-auth', 'language', 'check-setup'}
         if args[0] not in allowed:
             raise ValueError('Unsupported action')
         if args[0] == 'language' and len(args) == 2:
@@ -354,10 +354,13 @@ class Service:
                     with self.lock:
                         active = bool(self.clients)
                     if active:
-                        try:
-                            modified = self.h.CONFIG_PATH.stat().st_mtime_ns
-                        except OSError:
-                            modified = 0
+                        modified = []
+                        for file in (self.h.CONFIG_PATH, self.h.OAUTH_CLIENT_PATH):
+                            try:
+                                stat = file.stat()
+                                modified.append((stat.st_mtime_ns, stat.st_size, stat.st_ino, stat.st_mode))
+                            except OSError:
+                                modified.append(None)
                         if modified != self.config_mtime:
                             self.config_mtime = modified
                             self.publish()

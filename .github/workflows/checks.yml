@@ -24,5 +24,6 @@ jobs:
         run: |
           /usr/bin/python3 -m venv /tmp/qml-check
           /tmp/qml-check/bin/pip install PySide6-Essentials==6.12.0
-          /tmp/qml-check/bin/pyside6-qmlformat BarWidget.qml > /dev/null
-          /tmp/qml-check/bin/pyside6-qmlformat Panel.qml > /dev/null
+          for file in *.qml; do /tmp/qml-check/bin/pyside6-qmlformat "$file" > /dev/null; done
+      - name: Render localized setup guide with host shims
+        run: QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software /tmp/qml-check/bin/python tests/setup_help_qml.py
