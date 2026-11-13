@@ -26,6 +26,7 @@ Panel {
   property int flashDurationSeconds: 60
   property bool flashUntilClicked: false
   property bool isActionRunning: false
+  property bool networkBusy: false
 
   property color themeGreen: Color.accent
   property color themeRed: (root.bar && root.bar.urgent) ? root.bar.urgent : Color.urgent
@@ -195,9 +196,9 @@ Panel {
           visible: root.accounts.length > 0
           text: root.tr("Actualizar", "Update")
           iconText: "\uf021"
-          iconSpinning: root.isActionRunning
+          iconSpinning: root.isActionRunning || root.networkBusy
           bordered: true
-          enabled: !root.isActionRunning
+          enabled: !root.isActionRunning && !root.networkBusy
           fontSize: Style.font.bodySmall
           horizontalPadding: Style.space(8)
           verticalPadding: Style.space(3)
@@ -566,6 +567,7 @@ Panel {
       Ui.Button {
         width: parent.width
         text: root.tr("Añadir cuenta de Gmail", "Add Gmail account")
+        enabled: !root.isActionRunning && !root.networkBusy
         iconText: "\uf0e0"
         leftAlign: true
         bordered: true
@@ -618,9 +620,9 @@ Panel {
           id: updateAccountBtn
           text: root.tr("Actualizar", "Update")
           iconText: "\uf021"
-          iconSpinning: root.isActionRunning
+          iconSpinning: root.isActionRunning || root.networkBusy
           bordered: true
-          enabled: !root.isActionRunning
+          enabled: !root.isActionRunning && !root.networkBusy
           fontSize: Style.font.bodySmall
           horizontalPadding: Style.space(8)
           verticalPadding: Style.space(3)
@@ -641,7 +643,7 @@ Panel {
         visible: parent.selected && parent.selected.messages.length === 0
         width: parent.width
         text: parent.selected && parent.selected.unread_count > 0 && parent.selected.details_ready !== true
-          ? root.isActionRunning ? root.tr("Cargando remitente y asunto…", "Loading sender and subject…") : root.tr("Pulsa Cargar mensajes para reintentar", "Choose Load messages to retry")
+          ? (root.isActionRunning || root.networkBusy) ? root.tr("Cargando remitente y asunto…", "Loading sender and subject…") : root.tr("Pulsa Cargar mensajes para reintentar", "Choose Load messages to retry")
           : root.tr("No hay mensajes sin leer en Recibidos", "No unread messages in Inbox")
         color: root.panelText
         font.pixelSize: root.configuredFontSize
@@ -652,7 +654,7 @@ Panel {
         visible: parent.selected && (parent.selected.details_ready !== true || parent.selected.details_more === true)
         Ui.Button {
           text: root.tr("Cargar mensajes", "Load messages")
-          enabled: !root.isActionRunning
+          enabled: !root.isActionRunning && !root.networkBusy
           onClicked: root.runAction(["more-details", root.selectedAccountId])
         }
       }

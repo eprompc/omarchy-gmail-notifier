@@ -3,6 +3,7 @@ import fcntl
 import json
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -22,12 +23,23 @@ def private_directory(path):
 
 
 @contextmanager
-def locked(path):
+def locked(path, timeout=None):
     private_directory(path.parent)
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "a") as stream:
         os.chmod(path, 0o600)
-        fcntl.flock(stream, fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise StorageError('Local mail state is busy; polling will retry.') from None
+                    time.sleep(0.02)
         yield
 
 

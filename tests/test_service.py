@@ -51,11 +51,11 @@ class ServiceTests(unittest.TestCase):
         store=AlertStore(self.directory);store.observe('a',['old'],True,60);store.observe('a',['new'],True,60)
         event=store.read()['a']['event_id']
         blocked=threading.Event();release=threading.Event()
-        real_call=self.service.call
+        real_call=self.service.run_network
         def call(args):
             if args==['update']: blocked.set();release.wait(3);return {'ok':True}
             return real_call(args)
-        self.service.call=call
+        self.service.run_network=call
         worker=threading.Thread(target=self.service.worker,daemon=True);worker.start()
         self.service.jobs.put((['update'],None,None));self.assertTrue(blocked.wait(1))
         self.service.request({'args':['ack-alert','a',event],'request_id':0},None)

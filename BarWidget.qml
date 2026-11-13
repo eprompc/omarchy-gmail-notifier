@@ -31,6 +31,8 @@ BarWidget {
   property var currentAction: []
   property int requestSequence: 0
   property bool isActionRunning: false
+  property bool networkBusy: false
+  property string pendingDetailsId: ""
   property string actionError: ""
   Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
   Connections {
@@ -91,6 +93,7 @@ BarWidget {
     panelLoader.item.flashDurationSeconds = root.flashDurationSeconds
     panelLoader.item.flashUntilClicked = root.flashUntilClicked
     panelLoader.item.isActionRunning = root.isActionRunning
+    panelLoader.item.networkBusy = root.networkBusy
   }
 
   function open() {
@@ -117,6 +120,7 @@ BarWidget {
   }
 
   function showAccount(accountId, anchor) {
+    pendingDetailsId = ""
     var wasSame = selectedAccountId === accountId && !settingsMode && opened
     selectedAccountId = accountId
     settingsMode = false
@@ -125,11 +129,13 @@ BarWidget {
     if (wasSame) close()
     else {
       open()
-      runAction(["details", accountId])
+      if (networkBusy || isActionRunning) pendingDetailsId = accountId
+      else runAction(["details", accountId])
     }
   }
 
   function showSettings(anchor) {
+    pendingDetailsId = ""
     settingsMode = true
     selectedAnchor = anchor || (root.accounts.length === 0 ? manageButton : selectedAnchor)
     injectPanel()
@@ -171,9 +177,15 @@ BarWidget {
         var completed = currentAction
         currentAction = []
         isActionRunning = false
-        if (packet.ok !== true) actionError = String(packet.error || "The requested action failed")
-        if (packet.ok === true && completed[0] === "update" && opened && !settingsMode)
-          actionQueue = actionQueue.concat([["details", selectedAccountId]])
+        if (packet.code === "busy") {
+          networkBusy = true
+          if (completed[0] === "details" && opened && !settingsMode)
+            pendingDetailsId = selectedAccountId
+        } else if (packet.ok !== true) {
+          actionError = String(packet.error || "The requested action failed")
+        }
+        if (packet.code !== "busy" && completed[0] === "update" && opened && !settingsMode)
+          pendingDetailsId = selectedAccountId
         injectPanel()
         Qt.callLater(startNextAction)
       }
@@ -186,6 +198,7 @@ BarWidget {
   function receiveSnapshot(value) {
     try {
       var result = JSON.parse(value)
+      networkBusy = result.network_busy === true
       if (result.ok !== true) {
         lastError = String(result.error || "Could not read Gmail status")
         injectPanel()
@@ -203,12 +216,13 @@ BarWidget {
       if (Number.isFinite(Number(result.panel_width))) panelWidth = Number(result.panel_width)
       language = ["en", "es"].indexOf(result.language) >= 0 ? result.language : "auto"
       oauthReady = result.oauth_ready === true
-      lastError = String(result.error || "")
+      lastError = String(result.error || result.network_error || "")
       injectPanel()
       var selected = Model.accountById(accounts, selectedAccountId)
       if (!settingsMode && selected && Model.messageCount(selected) === 0)
         selectedAnchor = manageButton
       injectPanel()
+      Qt.callLater(startNextAction)
     } catch (error) {
       lastError = "Invalid response from Gmail Notifier helper"
     }
@@ -216,13 +230,28 @@ BarWidget {
 
   function runAction(args) {
     if (!connected) { actionError = "Gmail service is disconnected"; injectPanel(); return }
+    if (["update", "details", "more-details", "add-account"].indexOf(args[0]) >= 0 &&
+        (networkBusy || (isActionRunning && ["update", "details", "more-details", "add-account"].indexOf(currentAction[0]) >= 0))) {
+      if (args[0] === "details") pendingDetailsId = args[1]
+      return
+    }
+    if (args[0] === "update" && actionQueue.some(function(item) { return item[0] === "update" })) return
     if (actionQueue.length >= 32) { actionError = "Too many queued actions"; injectPanel(); return }
     actionQueue = actionQueue.concat([args])
     startNextAction()
   }
 
   function startNextAction() {
-    if (isActionRunning || actionQueue.length === 0 || !connected) return
+    if (isActionRunning || !connected) return
+    if (actionQueue.length === 0) {
+      if (!networkBusy && pendingDetailsId && opened && !settingsMode && pendingDetailsId === selectedAccountId) {
+        var accountId = pendingDetailsId
+        pendingDetailsId = ""
+        runAction(["details", accountId])
+      }
+      return
+    }
+    if (networkBusy && ["update", "details", "more-details", "add-account"].indexOf(actionQueue[0][0]) >= 0) return
     currentAction = actionQueue[0]
     actionQueue = actionQueue.slice(1)
     requestSequence += 1
@@ -269,6 +298,8 @@ BarWidget {
     onExited: {
       root.connected = false
       root.isActionRunning = false
+      root.networkBusy = false
+      root.pendingDetailsId = ""
       root.actionQueue = []
       root.currentAction = []
       root.actionError = "Gmail service disconnected; pending actions were cancelled."

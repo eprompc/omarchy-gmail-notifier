@@ -664,8 +664,86 @@ def effective_language(language):
     return getattr(NETWORK_CONTEXT, 'language', None) or os.environ.get('LANG', 'en').split('.')[0].replace('_', '-')
 
 
+def poll_account(config, account, force=False):
+    if not account['enabled'] or (not force and account.get('retry_at', 0) > time.time()):
+        return
+    # A slow account gets its own budget; it cannot consume every other
+    # account's allowance and permanently starve accounts later in the list.
+    try:
+        with network_budget():
+            request_timeout()
+            token = token_lookup(account['email'], account['generation'])
+            access, _ = refresh_access_token(account['email'], token, account['generation'])
+            ids = list_unread_ids(access)
+            request_timeout()
+            new_ids = [i for i in ids if i not in account.get('last_notification_ids', [])]
+            newest = []
+            if account.get('notifications') and account.get('notification_baseline_set') and new_ids:
+                try:
+                    newest = fetch_metadata(access, new_ids[:1])
+                except NotifierError:
+                    pass
+            request_timeout()
+            with config_transaction() as latest:
+                current = find_account(latest, account['id'])
+                if not current or not current['enabled'] or current.get('generation') != account.get('generation'):
+                    return
+                account.update({k: current[k] for k in ('initial', 'notifications')})
+                AlertStore(APP_DIR).observe(account['id'], ids, latest['flash_until_clicked'], latest['flash_duration_seconds'])
+                account['unread_ids'] = ids
+                messages, ready = read_details_cache(account['email'], ids)
+                account.update(messages=messages, unread_count=len(ids), details_ready=ready or not ids,
+                               details_loaded=len(messages), details_more=len(messages) < len(ids), failures=0, retry_at=0)
+                account.pop('last_error', None)
+                account.pop('details_error', None)
+                deliver_notification(account, ids, newest, latest['language'])
+                current['last_notification_ids'] = ids
+                current['notification_baseline_set'] = True
+    except (NotifierError, StorageError, OSError, ValueError, TypeError, KeyError) as error:
+        failures = min(6, int(account.get('failures', 0)) + 1)
+        message = str(error) if isinstance(error, (NotifierError, StorageError)) else 'Could not update this account; polling will retry.'
+        account.update(last_error=message, failures=failures,
+                       retry_at=time.time() + max(getattr(error, 'retry_after', 0), min(900, 30 * 2 ** (failures - 1))))
+
+
+def poll_one(account_id, force=False):
+    with locked(SNAPSHOT_LOCK_PATH):
+        config = load_config()
+        previous = load_runtime_snapshot() or {'checked_at': 0, 'accounts': []}
+        accounts = merge_runtime_accounts(config, previous)
+        account = next((a for a in accounts if a['id'] == account_id), None)
+        if account is not None:
+            poll_account(config, account, force)
+        latest = load_config()
+        save_runtime_snapshot(merge_runtime_accounts(latest, {'accounts': accounts}), previous['checked_at'])
+        state = snapshot_result(latest, load_runtime_snapshot())
+        error = account.get('last_error', '') if account else ''
+        state['ok'] = not bool(error)
+        if error:
+            state['error'] = 'One account could not be updated; automatic polling will retry.'
+        emit(state)
+        return 0 if state['ok'] else 1
+
+
+def record_poll_failure(account_id, message):
+    with locked(SNAPSHOT_LOCK_PATH, timeout=1):
+        config = load_config()
+        previous = load_runtime_snapshot() or {'checked_at': 0, 'accounts': []}
+        accounts = merge_runtime_accounts(config, previous)
+        for account in accounts:
+            if account['id'] == account_id and account['enabled']:
+                account.update(last_error=message, retry_at=time.time() + 30)
+        save_runtime_snapshot(accounts, previous['checked_at'])
+
+
+def finish_poll():
+    with locked(SNAPSHOT_LOCK_PATH, timeout=1):
+        config = load_config()
+        save_runtime_snapshot(merge_runtime_accounts(config, load_runtime_snapshot()), time.time())
+
+
 def build_snapshot(force: bool = False) -> dict:
-    with locked(SNAPSHOT_LOCK_PATH), network_budget():
+    with locked(SNAPSHOT_LOCK_PATH):
         config = load_config()
         previous = load_runtime_snapshot()
         checked_at = float((previous or {}).get('checked_at', 0))
@@ -673,41 +751,15 @@ def build_snapshot(force: bool = False) -> dict:
             return snapshot_result(config, previous)
         polled_accounts = merge_runtime_accounts(config, previous)
         for account in polled_accounts:
-            if not account['enabled'] or (not force and account.get('retry_at', 0) > time.time()):
-                continue
-            try:
-                request_timeout()
-                token = token_lookup(account['email'], account['generation'])
-                access, _ = refresh_access_token(account['email'], token, account['generation'])
-                ids = list_unread_ids(access)
-                # Fetch optional notification metadata outside the config lock.
-                new_ids = [i for i in ids if i not in account.get('last_notification_ids', [])]
-                newest = None
-                if account.get('notifications') and account.get('notification_baseline_set') and new_ids:
-                    try:
-                        newest = fetch_metadata(access, new_ids[:1])
-                    except NotifierError:
-                        newest = []
-                with config_transaction() as latest:
-                    current = find_account(latest, account['id'])
-                    if not current or not current['enabled'] or current.get('generation') != account.get('generation'):
-                        continue
-                    account.update({k: current[k] for k in ('initial', 'notifications')})
-                    AlertStore(APP_DIR).observe(account['id'], ids, latest['flash_until_clicked'], latest['flash_duration_seconds'])
-                    account['unread_ids'] = ids
-                    messages, ready = read_details_cache(account['email'], ids)
-                    account.update(messages=messages, unread_count=len(ids), details_ready=ready or not ids,
-                                   details_loaded=len(messages), details_more=len(messages) < len(ids), failures=0, retry_at=0)
-                    account.pop('last_error', None)
-                    account.pop('details_error', None)
-                    # Metadata was fetched before the short config transaction.
-                    deliver_notification(account, ids, newest or [], latest['language'])
-                    current['last_notification_ids'] = ids
-                    current['notification_baseline_set'] = True
-            except (NotifierError, OSError) as error:
-                failures = min(6, int(account.get('failures', 0)) + 1)
-                account.update(last_error=str(error), failures=failures,
-                               retry_at=time.time() + max(getattr(error, 'retry_after', 0), min(900, 30 * 2 ** (failures - 1))))
+            poll_account(config, account, force)
+            # Publish completed accounts incrementally without marking the whole
+            # poll as finished or resetting another account's saved settings.
+            latest = load_config()
+            merged = merge_runtime_accounts(latest, {'accounts': polled_accounts})
+            save_runtime_snapshot(merged, checked_at)
+            progress = getattr(OUTPUT, 'progress', None)
+            if progress is not None:
+                progress()
         latest = load_config()
         merged = merge_runtime_accounts(latest, {'accounts': polled_accounts})
         save_runtime_snapshot(merged, time.time())
@@ -876,6 +928,19 @@ def remove_account(account_id: str) -> int:
 
 def main(argv: list[str]) -> int:
     try:
+        if argv == ['job']:
+            line = sys.stdin.buffer.readline(8193)
+            if len(line) > 8192:
+                raise NotifierError('Invalid mail job request.')
+            packet = json.loads(line)
+            args = packet.get('args') if isinstance(packet, dict) else None
+            if not isinstance(args, list) or not args or args[0] not in ('snapshot', 'update', 'poll-one', 'details', 'more-details', 'add-account') or len(args) > 3 or not all(isinstance(x, str) and len(x) <= 1024 and '\0' not in x for x in args):
+                raise NotifierError('Invalid mail job request.')
+            language = packet.get('language', 'en')
+            if isinstance(language, str) and len(language) <= 16:
+                NETWORK_CONTEXT.language = language
+            OUTPUT.progress = lambda: emit({'type': 'progress'})
+            return main(args)
         if argv == ["serve"]:
             from service import Service
             Service(sys.modules[__name__]).run()
@@ -888,6 +953,8 @@ def main(argv: list[str]) -> int:
             emit(build_snapshot())
             return 0
         command, *args = argv
+        if command == 'poll-one' and len(args) == 2:
+            return poll_one(args[0], args[1] == 'true')
         if command == "state" and not args:
             emit(snapshot_result(load_config(), load_runtime_snapshot()))
             return 0
